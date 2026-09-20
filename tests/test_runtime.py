@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -110,7 +111,12 @@ def _config(tmp_path: Path, *, webhook_url: str | None = None) -> Config:
 def _seed_watch(config: Config, *, profile: Profile | None = None) -> None:
     history = HistoryStore(config.db_path)
     try:
-        assert history.register_watch("alice", 300).spec is not None
+        spec = history.register_watch("alice", 300).spec
+        assert spec is not None
+        # The headless daemon now checks a clean never-checked registration at
+        # once. These tests drive the tick explicitly, so record one earlier
+        # success and keep the scheduled loop a full interval away.
+        assert history.update_watch_state(spec, last_ok=int(time.time()))
         if profile is not None:
             history.add_snapshot(history.snapshot_from_profile(profile, post_pks=[]))
     finally:

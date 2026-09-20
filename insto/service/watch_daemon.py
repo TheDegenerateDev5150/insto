@@ -33,17 +33,30 @@ class WatchLoadEstimate:
     backend_calls_per_hour_high: float
 
 
-def initial_watch_delay(spec: WatchSpec, *, now: float) -> float:
+def wants_first_check_now(spec: WatchSpec) -> bool:
+    """True for a registration nobody has checked yet that has never failed.
+
+    A crash or a restart loop must not spend quota on every start, so a
+    never-succeeded row that already carries an error keeps its full interval.
+    """
+    return spec.last_ok is None and spec.consecutive_errors == 0 and spec.last_error is None
+
+
+def initial_watch_delay(spec: WatchSpec, *, now: float, first_check_now: bool = False) -> float:
     if spec.last_ok is None:
+        if first_check_now and wants_first_check_now(spec):
+            return 0.0
         return float(spec.interval_seconds)
     return max(0.0, float(spec.last_ok + spec.interval_seconds) - now)
 
 
-def startup_offsets(specs: list[WatchSpec], *, now: float) -> dict[str, float]:
+def startup_offsets(
+    specs: list[WatchSpec], *, now: float, first_check_now: bool = False
+) -> dict[str, float]:
     delays: dict[str, float] = {}
     overdue_index = 0
     for spec in sorted(specs, key=lambda item: item.user):
-        delay = initial_watch_delay(spec, now=now)
+        delay = initial_watch_delay(spec, now=now, first_check_now=first_check_now)
         if delay == 0:
             delay = float(overdue_index * 2)
             overdue_index += 1
@@ -138,14 +151,26 @@ class WatchDaemon:
         for user in sorted(removals):
             await self._manager.remove(user, release_when_empty=False)
 
-        delays = startup_offsets(list(persisted.values()), now=self._now()) if recovering else {}
+        # Only the headless daemon promotes a never-checked registration to an
+        # immediate first tick; the REPL keeps its full-interval first delay.
+        first_check_now = self._role == "daemon"
+        delays = (
+            startup_offsets(
+                list(persisted.values()), now=self._now(), first_check_now=first_check_now
+            )
+            if recovering
+            else {}
+        )
         for user in sorted((persisted.keys() - local.keys()) | replacements):
             spec = persisted[user]
             self._manager.add(
                 spec,
                 tick=self._tick_factory(user),
                 state_changed=self._persist_state,
-                initial_delay=delays.get(user, initial_watch_delay(spec, now=self._now())),
+                initial_delay=delays.get(
+                    user,
+                    initial_watch_delay(spec, now=self._now(), first_check_now=first_check_now),
+                ),
             )
 
         if self._role == "repl" and not persisted and not self._manager.list():
@@ -259,4 +284,5 @@ __all__ = [
     "estimate_watch_load",
     "initial_watch_delay",
     "startup_offsets",
+    "wants_first_check_now",
 ]

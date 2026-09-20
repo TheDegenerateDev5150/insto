@@ -131,9 +131,14 @@ order-controlled lifecycle.
 
 `registration_id` is an opaque generation token: a stale in-flight tick cannot
 update a row that was deleted and re-added. It is never exposed in terminal or
-JSON output. New rows without a prior success wait one interval; recovered due
-rows start at offsets 0/2/4 seconds. Subsequent polling is fixed-delay, so one
-target never overlaps itself.
+JSON output. In the headless daemon (`insto watch-daemon` and the managed
+LaunchAgent) a registration that has never been checked and carries no error is
+checked right away, so adding an account does something visible instead of
+waiting a full interval; a never-succeeded row that already failed keeps the
+full interval, so a crash or restart loop cannot spend quota on every start. In
+the REPL a new row still waits one interval. Zero delays — new and recovered due
+rows alike — start at offsets 0/2/4 seconds. Subsequent polling is fixed-delay,
+so one target never overlaps itself.
 
 A tick retries once. Two consecutive failed ticks persist `paused`, including
 across restarts; `Banned` and `AuthInvalid` pause immediately. Success clears the
