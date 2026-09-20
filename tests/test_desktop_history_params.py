@@ -39,6 +39,23 @@ def test_normalized_defaults_and_decimal_identity():
         _canonical_watch_user(" @alice")  # the CLI order keeps this invalid; so do we
 
 
+def test_snapshot_read_takes_exactly_one_side_of_the_compare_pair():
+    assert CAPABILITIES == (
+        "snapshots.targets",
+        "snapshots.list",
+        "snapshots.compare",
+        "snapshots.read",
+        "changes.list",
+    )
+    assert validate_params(
+        "snapshots.read", {"target_pk": "9007199254740993", "snapshot_id": "42"}
+    ) == {"target_pk": "9007199254740993", "snapshot_id": "42"}
+    # The same bounds as one side of the pair: 64-digit PK, 19-digit snapshot ID.
+    assert validate_params(
+        "snapshots.read", {"target_pk": "1" * 64, "snapshot_id": "9223372036854775807"}
+    ) == {"target_pk": "1" * 64, "snapshot_id": "9223372036854775807"}
+
+
 @pytest.mark.parametrize("value", [True, 1.0, 0, 51, "3", None])
 def test_limit_is_a_bounded_actual_integer(value):
     with pytest.raises(DesktopError, match="invalid_params"):
@@ -70,6 +87,20 @@ def test_limit_is_a_bounded_actual_integer(value):
             {"target_pk": "1", "older_id": "1", "newer_id": "9223372036854775808"},
         ),
         ("snapshots.compare", {"target_pk": "1", "older_id": "1", "newer_id": True}),
+        ("snapshots.read", {}),
+        ("snapshots.read", {"target_pk": "1"}),
+        ("snapshots.read", {"snapshot_id": "1"}),
+        ("snapshots.read", {"target_pk": "1", "snapshot_id": "1", "limit": 1}),
+        ("snapshots.read", {"target_pk": "1", "snapshot_id": "1", "cursor": "x"}),
+        ("snapshots.read", {"target_pk": "1", "older_id": "1"}),
+        ("snapshots.read", {"target_pk": "01", "snapshot_id": "1"}),
+        ("snapshots.read", {"target_pk": 1, "snapshot_id": "1"}),
+        ("snapshots.read", {"target_pk": "1" * 65, "snapshot_id": "1"}),
+        ("snapshots.read", {"target_pk": "1", "snapshot_id": "01"}),
+        ("snapshots.read", {"target_pk": "1", "snapshot_id": 1}),
+        ("snapshots.read", {"target_pk": "1", "snapshot_id": True}),
+        ("snapshots.read", {"target_pk": "1", "snapshot_id": None}),
+        ("snapshots.read", {"target_pk": "1", "snapshot_id": "9223372036854775808"}),
     ],
 )
 def test_rejects_ambiguous_or_expansive_parameters(operation, params):
@@ -119,5 +150,5 @@ def test_parameter_module_has_no_profile_or_provider_imports(monkeypatch):
     for name in ("insto.desktop.profile", "insto.desktop.history", "hikerapi", "aiograpi"):
         monkeypatch.setitem(sys.modules, name, None)
     module = importlib.reload(sys.modules["insto.desktop.history_params"])
-    assert len(module.CAPABILITIES) == len(CAPABILITIES) == 4
+    assert len(module.CAPABILITIES) == len(CAPABILITIES) == 5
     assert module.validate_params("changes.list", {})["limit"] == 50

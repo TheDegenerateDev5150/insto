@@ -13,6 +13,7 @@ CAPABILITIES = (
     "snapshots.targets",
     "snapshots.list",
     "snapshots.compare",
+    "snapshots.read",
     "changes.list",
 )
 MAX_CURSOR = 1024
@@ -121,6 +122,15 @@ def validate_params(operation: str, params: dict[str, Any]) -> dict[str, Any]:
         if result["older_id"] == result["newer_id"]:
             _invalid()
         return result
+    if operation == "snapshots.read":
+        # One side of the compare pair: the same decimal rules, the same bounds
+        # and the same error code, so the GUI validates both the same way.
+        if params.keys() != {"target_pk", "snapshot_id"}:
+            _invalid()
+        return {
+            "target_pk": _decimal(params["target_pk"]),
+            "snapshot_id": _decimal(params["snapshot_id"], snapshot=True),
+        }
     required = (
         {"username"}
         if operation == "snapshots.targets"

@@ -18,6 +18,7 @@ from insto.service.history_readonly import (
     comparison,
     metadata,
     snapshot,
+    snapshot_fields,
 )
 
 
@@ -71,6 +72,16 @@ def _pair(reader: Reader, params: dict[str, Any], check: Check) -> dict[str, Any
     if older_meta.key >= newer_meta.key:
         raise DesktopError("invalid_params")
     return comparison(snapshot(before, check), snapshot(after, check), check)
+
+
+def _single(reader: Reader, params: dict[str, Any], check: Check) -> dict[str, Any]:
+    """One selected snapshot, validated exactly like one side of the pair."""
+    row = reader.selected(int(params["snapshot_id"]))
+    if row is None:
+        raise DesktopError("snapshot_unavailable")
+    if metadata(row).target_pk != params["target_pk"]:
+        raise DesktopError("snapshot_identity_mismatch")
+    return snapshot_fields(snapshot(row, check), check)
 
 
 def _pages(reader: Reader, operation: str, params: dict[str, Any], check: Check) -> dict[str, Any]:
@@ -163,16 +174,12 @@ def run(
     try:
         with read_database(profile, deadline=deadline) as connection:
             reader = Reader(connection, check)
-            result = (
-                _pair(reader, params, check)
-                if operation == "snapshots.compare"
-                else _pages(
-                    reader,
-                    operation,
-                    params,
-                    check,
-                )
-            )
+            if operation == "snapshots.compare":
+                result = _pair(reader, params, check)
+            elif operation == "snapshots.read":
+                result = _single(reader, params, check)
+            else:
+                result = _pages(reader, operation, params, check)
             check()
             if len(_wire(result)) >= MAX_OUTPUT_BYTES:
                 raise DesktopError("history_oversized")

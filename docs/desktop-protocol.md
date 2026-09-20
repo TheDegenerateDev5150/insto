@@ -228,7 +228,8 @@ requires reading current state; do not automatically retry a non-idempotent add.
 ## C2b saved history operations
 
 The additional capabilities are `snapshots.targets`, `snapshots.list`,
-`snapshots.compare` and `changes.list`. They inspect saved SQLite snapshots only.
+`snapshots.compare`, `snapshots.read` and `changes.list`. They inspect saved
+SQLite snapshots only.
 They never construct a provider, call live `/diff` or command `/history`, start a
 scheduler, download historical media, change a watch, or prune the database.
 
@@ -239,6 +240,7 @@ Exact parameters:
 | `snapshots.targets` | `username` | `limit`, `cursor` |
 | `snapshots.list` | `target_pk` | `limit`, `cursor` |
 | `snapshots.compare` | `target_pk`, `older_id`, `newer_id` | none |
+| `snapshots.read` | `target_pk`, `snapshot_id` | none |
 | `changes.list` | none | `target_pk`, `limit`, `cursor` |
 
 Username accepts one optional leading `@`, followed by 1–255 ASCII letters,
@@ -293,6 +295,20 @@ value. Missing selected IDs return `snapshot_unavailable`, prompting a list
 refresh. A different PK returns `snapshot_identity_mismatch`; reversed/equal
 pair ordering returns `invalid_params`. The API does not manufacture a prior
 snapshot from null.
+
+`snapshots.read` returns one selected snapshot as
+`{kind:"snapshot_fields",snapshot,fields,unknown_fields}`. `snapshot` is the same
+metadata DTO the list returns. `fields` maps each tracked field the snapshot has
+to its value — the same names, the same `str`/`int`/`bool`/null typing and the
+same `avatar` and `banner` stored-hash treatment `snapshots.compare` reports in
+its `changes` values, so one formatter serves both. Absent tracked fields are
+listed in `unknown_fields` in the same order `snapshots.compare` uses; explicit
+JSON null is a known value. Its parameters are validated exactly like one side
+of the compare pair, with the same `invalid_params` code. A missing ID returns
+`snapshot_unavailable`, a snapshot of another target returns
+`snapshot_identity_mismatch`, an unreadable row returns `history_corrupt`, and a
+record over the raw byte cap or a response over the wire budget returns
+`history_oversized`.
 
 `changes.list` compares each candidate with its immediately preceding retained
 snapshot within the same PK and initial ID ceiling. Its earliest retained

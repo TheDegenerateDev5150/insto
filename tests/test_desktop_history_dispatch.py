@@ -28,10 +28,14 @@ def wire(operation, params, request_id="history-1"):
     ).encode()
 
 
-async def test_hello_advertises_all_four_saved_operations():
+async def test_hello_advertises_all_five_saved_operations():
     result = json.loads(await handle(wire("hello", {})))["result"]
     assert set(CAPABILITIES) <= set(result["capabilities"])
     assert len(result["capabilities"]) == len(set(result["capabilities"]))
+    # snapshots.read sits directly after snapshots.compare, in both tables.
+    index = result["capabilities"].index("snapshots.compare")
+    assert result["capabilities"][index + 1] == "snapshots.read"
+    assert CAPABILITIES[CAPABILITIES.index("snapshots.compare") + 1] == "snapshots.read"
 
 
 @pytest.mark.parametrize(
@@ -40,6 +44,7 @@ async def test_hello_advertises_all_four_saved_operations():
         ("snapshots.targets", {"username": "@Alice"}),
         ("snapshots.list", {"target_pk": "7"}),
         ("snapshots.compare", {"target_pk": "7", "older_id": "1", "newer_id": "2"}),
+        ("snapshots.read", {"target_pk": "7", "snapshot_id": "1"}),
         ("changes.list", {}),
     ],
 )
@@ -179,6 +184,45 @@ async def test_populated_list_and_compare_through_real_handle(monitoring_profile
         "follower_count": (1, 2),
     }
     assert result["unknown_fields"] == []
+
+
+async def test_populated_read_through_real_handle(monitoring_profile, monkeypatch):
+    from tests.test_desktop_saved_history import fields, insert
+
+    p = monitoring_profile
+    identifier = insert(p, stamp=2, payload=fields(follower_count=2, full_name="Alice"))
+    monkeypatch.setenv("INSTO_DESKTOP_ROOT", str(p.root))
+    params = {"target_pk": "7", "snapshot_id": identifier}
+    raw = await handle(wire("snapshots.read", params, request_id="read-1"))
+    assert raw.count(b"\n") == 1 and raw.endswith(b"\n")
+    assert json.loads(raw) == {
+        "protocol_version": 1,
+        "request_id": "read-1",
+        "result": {
+            "kind": "snapshot_fields",
+            "snapshot": {"id": identifier, "target_pk": "7", "captured_at": 2},
+            "fields": {
+                "username": "alice",
+                "full_name": "Alice",
+                "biography": "",
+                "external_url": None,
+                "is_verified": None,
+                "is_business": None,
+                "is_private": None,
+                "follower_count": 2,
+                "following_count": None,
+                "media_count": None,
+                "public_email": None,
+                "public_phone": None,
+                "business_category": None,
+                "avatar": None,
+                "banner": None,
+            },
+            "unknown_fields": [],
+        },
+    }
+    mismatch = await handle(wire("snapshots.read", {**params, "target_pk": "8"}))
+    assert json.loads(mismatch)["error"]["code"] == "snapshot_identity_mismatch"
 
 
 def test_fresh_process_reads_without_provider_or_native_work(monitoring_profile):
