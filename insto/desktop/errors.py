@@ -10,10 +10,20 @@ MESSAGES: dict[str, tuple[str, bool]] = {
     "network_error": ("Provider access is temporarily unavailable.", True),
     "access_unconfirmed": ("Provider access could not be confirmed.", True),
     "operation_timeout": ("The operation timed out; inspect its state before retrying.", False),
-    # A looked-up account that the provider cannot show. Neither is retryable:
-    # a second identical request within the session gets the same answer.
+    # A looked-up account the provider will not show, and an answer this core
+    # cannot read. None of them is retryable: an identical request gets the
+    # identical answer, and on a paid provider a retry spends the same money.
+    # `target_unavailable` deliberately names no cause — a bare 403 may be the
+    # target's own restriction or this account's access, and the provider does
+    # not say which, so the message must not decide it for the user.
     "target_not_found": ("No account matches that lookup.", False),
     "target_private": ("The account does not share this data publicly.", False),
+    "target_unavailable": (
+        "The provider refused this request for the account; it may be restricted, "
+        "or the access may be limited.",
+        False,
+    ),
+    "provider_response_invalid": ("The provider's answer could not be read safely.", False),
     "profile_busy": ("Another profile operation is in progress.", True),
     "profile_ownership": ("The profile cannot be managed safely.", False),
     "not_configured": ("The profile is not configured.", False),

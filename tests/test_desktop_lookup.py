@@ -16,6 +16,7 @@ from insto.exceptions import (
     AuthInvalid,
     BackendError,
     Banned,
+    PageBudgetExceeded,
     ProfileDeleted,
     ProfileNotFound,
     ProfilePrivate,
@@ -75,9 +76,23 @@ def make_post(index, *, place=None, lat=None, lng=None, likes=0, tags=(), mentio
 class FakeBackend:
     """Records every provider call; nothing here touches a real network."""
 
-    def __init__(self, *, posts=(), page=50, quota=None, profile=None, errors=None, hang=False):
+    def __init__(
+        self,
+        *,
+        posts=(),
+        page=50,
+        quota=None,
+        profile=None,
+        errors=None,
+        hang=False,
+        endless=False,
+    ):
         self.posts = list(posts)
         self.page = page
+        # `endless` mimics a provider whose cursor never terminates, so the
+        # page ceiling is the only thing that can stop the spending.
+        self.endless = endless
+        self.max_pages = lookup.MAX_PAGE_REQUESTS
         self.quota = Quota.unknown() if quota is None else Quota.with_remaining(quota)
         self.profile = profile_dto() if profile is None else profile
         self.errors = dict(errors or {})
@@ -108,18 +123,22 @@ class FakeBackend:
 
     async def iter_user_posts(self, pk, *, limit=None):
         index = 0
+        pages = 0
         while True:
+            if pages >= self.max_pages:
+                raise PageBudgetExceeded("user_medias_chunk_v1", self.max_pages)
             self.calls.append(("posts", pk, limit, index))
             if self.hang:
                 await asyncio.Event().wait()
             self._raise("posts")
+            pages += 1
             chunk = self.posts[index : index + self.page]
             for post in chunk:
                 yield post
                 index += 1
                 if limit is not None and index >= limit:
                     return
-            if len(chunk) < self.page:
+            if len(chunk) < self.page and not self.endless:
                 return
 
     def get_quota(self):
@@ -145,8 +164,13 @@ def constructed(monkeypatch):
     record = {}
 
     def install(backend):
-        def construct(token, *, proxy=None, retry_decorator=None):
-            record.update(token=token, proxy=proxy, retry_decorator=retry_decorator)
+        def construct(token, *, proxy=None, retry_decorator=None, max_pages=None):
+            record.update(
+                token=token,
+                proxy=proxy,
+                retry_decorator=retry_decorator,
+                max_pages=max_pages,
+            )
             return backend
 
         monkeypatch.setattr(lookup, "make_backend", construct)
@@ -198,7 +222,21 @@ async def test_profile_returns_the_tracked_vocabulary_and_costs_two_requests(
     assert backend.calls == [("resolve", "alice"), ("profile", "17841400000000001")]
     assert backend.closed == 1
     assert record["token"] == "offline-desktop-token" and record["proxy"] is None
-    assert record["retry_decorator"] is not None
+    assert record["max_pages"] == lookup.MAX_PAGE_REQUESTS
+
+    # The captured policy itself must fail fast: a five-attempt ladder here
+    # would sleep on the cooldown instead of raising on the first attempt.
+    attempts = []
+
+    @record["retry_decorator"]
+    async def rate_limited():
+        attempts.append(True)
+        raise RateLimited(retry_after=300.0)
+
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(RateLimited):
+        await rate_limited()
+    assert attempts == [True] and asyncio.get_running_loop().time() - started < 1.0
 
 
 async def test_profile_reports_a_private_account_without_refusing_it(lookup_profile, constructed):
@@ -221,10 +259,12 @@ async def test_profile_field_the_provider_cannot_supply_is_named_not_invented(
 
 
 async def test_profile_strings_are_bounded(lookup_profile, constructed):
-    constructed(FakeBackend(profile=profile_dto(biography="b" * 5000, full_name="f" * 900)))
+    overlong = {name: name[0] * 6000 for name in lookup._TEXT_CHARACTERS}
+    constructed(FakeBackend(profile=profile_dto(**overlong)))
     fields = (await call(lookup_profile, "lookup.profile", {"username": "alice"}))["fields"]
-    assert fields["biography"] == "b" * 2048
-    assert fields["full_name"] == "f" * 255
+    assert set(lookup._TEXT_CHARACTERS) <= set(fields)
+    for name, characters in lookup._TEXT_CHARACTERS.items():
+        assert fields[name] == overlong[name][:characters], name
 
 
 @pytest.mark.parametrize(
@@ -245,8 +285,18 @@ async def test_profile_missing_account_is_target_not_found(lookup_profile, const
 
 async def test_profile_identity_the_app_cannot_reuse_is_refused(lookup_profile, constructed):
     constructed(FakeBackend(profile=profile_dto(pk="017")))
-    with pytest.raises(DesktopError, match="access_unconfirmed"):
+    with pytest.raises(DesktopError, match="provider_response_invalid"):
         await call(lookup_profile, "lookup.profile", {"username": "alice"})
+    # A permanent property of the answer: the host must not offer a paid retry.
+    assert MESSAGES["provider_response_invalid"][1] is False
+
+
+@pytest.mark.parametrize("access", ["private", "followed", "blocked", "something_new"])
+async def test_only_a_public_answer_is_reported_as_public(lookup_profile, constructed, access):
+    """The permissive value is the one that means it; anything else is private."""
+    constructed(FakeBackend(profile=profile_dto(access=access)))
+    result = await call(lookup_profile, "lookup.profile", {"username": "alice"})
+    assert result["access"] == "private"
 
 
 # -------------------------------------------------------------- lookup.activity
@@ -366,13 +416,23 @@ async def test_activity_bounds_every_list_and_string(lookup_profile, constructed
     assert len(encoded) < 64 * 1024
 
 
-async def test_activity_of_a_private_or_restricted_account(lookup_profile, constructed):
-    for error in (ProfilePrivate("alice"), Banned("login-walled")):
-        backend = FakeBackend(errors={"posts": error})
-        constructed(backend)
-        with pytest.raises(DesktopError, match="target_private"):
-            await call(lookup_profile, "lookup.activity", {"target_pk": "7", "window": 12})
-        assert backend.closed == 1
+@pytest.mark.parametrize(
+    "error,code",
+    [
+        (ProfilePrivate("alice"), "target_private"),
+        # A bare 403 names no cause: it may be the target or this account's own
+        # access, and the user must not be told their plan problem is privacy.
+        (Banned("login-walled"), "target_unavailable"),
+    ],
+)
+async def test_activity_of_a_private_or_refused_account(lookup_profile, constructed, error, code):
+    backend = FakeBackend(errors={"posts": error})
+    constructed(backend)
+    with pytest.raises(DesktopError) as raised:
+        await call(lookup_profile, "lookup.activity", {"target_pk": "7", "window": 12})
+    assert raised.value.code == code
+    assert MESSAGES[code][1] is False
+    assert backend.closed == 1
 
 
 async def test_activity_of_a_vanished_account(lookup_profile, constructed):
@@ -391,7 +451,9 @@ async def test_activity_of_a_vanished_account(lookup_profile, constructed):
         (QuotaExhausted("balance"), "quota_exhausted"),
         (RateLimited(300.0, "cooldown"), "rate_limited"),
         (Transient("blip"), "network_error"),
-        (SchemaDrift("user", "pk"), "access_unconfirmed"),
+        (SchemaDrift("user", "pk"), "provider_response_invalid"),
+        (Banned("login-walled"), "target_unavailable"),
+        (ProfilePrivate("alice"), "target_private"),
         (BackendError("surprise"), "access_unconfirmed"),
         (RuntimeError("bug"), "access_unconfirmed"),
         (TimeoutError("slow"), "operation_timeout"),
@@ -529,8 +591,17 @@ async def test_a_lookup_opens_no_database_and_takes_no_lock(
     await call(lookup_profile, "lookup.activity", {"target_pk": "7", "window": 12})
 
 
+@pytest.mark.parametrize(
+    "operation,params",
+    [
+        ("lookup.profile", {"username": "alice"}),
+        # The generator path finalises an async iterator on cancellation; its
+        # stderr must stay as empty as the plain coroutine's.
+        ("lookup.activity", {"target_pk": "7", "window": 12}),
+    ],
+)
 async def test_the_process_path_answers_a_hanging_provider_with_operation_timeout(
-    lookup_profile, tmp_path
+    lookup_profile, tmp_path, operation, params
 ):
     """The whole child process: a cancelled worker becomes one static envelope."""
     import os
@@ -547,6 +618,10 @@ import insto.desktop.lookup as lookup
 class Hanging:
     async def resolve_target(self, username):
         await asyncio.Event().wait()
+
+    async def iter_user_posts(self, pk, *, limit=None):
+        await asyncio.Event().wait()
+        yield None
 
     def get_quota(self):
         raise AssertionError("never reached")
@@ -567,8 +642,8 @@ sys.stdout.buffer.write(asyncio.run(handle(sys.stdin.buffer.read())))
             {
                 "protocol_version": 1,
                 "request_id": "hang",
-                "operation": "lookup.profile",
-                "params": {"username": "alice"},
+                "operation": operation,
+                "params": params,
             }
         )
         + "\n"
@@ -591,3 +666,189 @@ sys.stdout.buffer.write(asyncio.run(handle(sys.stdin.buffer.read())))
         "retryable": False,
     }
     assert not (lookup_profile.home / "store.db").exists()
+
+
+# ------------------------------------------------- the paid-request ceiling
+
+
+def transport_backend(handler, *, max_pages=None):
+    """A real `HikerBackend` with the lookup's own policies over a mock transport.
+
+    The page ceiling and the retry policy are the ones `lookup.run` installs, so
+    these tests count the HTTP requests a real provider would actually be paid
+    for, not the calls a fake chose to record.
+    """
+    import hikerapi
+    import httpx
+
+    from insto.backends.hiker import HikerBackend
+
+    sdk = hikerapi.AsyncClient(token="offline-desktop-token", timeout=5.0)
+    client = httpx.AsyncClient(base_url=sdk._url, transport=httpx.MockTransport(handler))
+    client.headers.update(sdk._headers)
+    sdk._client = client
+    return HikerBackend(
+        client=sdk,
+        retry_decorator=lookup._fail_fast(),
+        max_pages=lookup.MAX_PAGE_REQUESTS if max_pages is None else max_pages,
+    )
+
+
+def media(index):
+    return {
+        "pk": str(9000 + index),
+        "code": f"code{index}",
+        "taken_at": MOMENT + index,
+        "media_type": 1,
+        "like_count": index,
+    }
+
+
+def chunk_handler(requests, *, per_page, endless=True, total=None):
+    """A provider whose cursor never terminates unless `total` posts are served."""
+    import httpx
+
+    def handler(request):
+        requests.append(str(request.url))
+        served = len(requests) - 1
+        if total is not None and served * per_page >= total:
+            return httpx.Response(200, json=[[], None])
+        items = [media(served * per_page + i) for i in range(per_page)]
+        cursor = f"cursor-{served + 1}" if endless or total is not None else None
+        return httpx.Response(200, json=[items, cursor])
+
+    return handler
+
+
+@pytest.mark.parametrize("per_page", [0, 1], ids=["empty-pages", "one-item-pages"])
+async def test_a_never_terminating_cursor_stops_at_the_page_ceiling(per_page):
+    """A thin or empty page with a live cursor must not keep spending money."""
+    requests = []
+    backend = transport_backend(chunk_handler(requests, per_page=per_page))
+    try:
+        result = await lookup._read(backend, "lookup.activity", {"target_pk": "7", "window": 50})
+    finally:
+        await backend.aclose()
+    assert len(requests) == lookup.MAX_PAGE_REQUESTS <= 6
+    # What was already paid for is answered, with the honest count.
+    assert result["kind"] == "lookup_activity"
+    assert result["analyzed"] == per_page * lookup.MAX_PAGE_REQUESTS
+    assert result["window"] == 50
+    assert result["likes"]["total"] == sum(range(result["analyzed"]))
+
+
+async def test_a_normal_page_reaches_the_largest_window_inside_the_ceiling():
+    requests = []
+    backend = transport_backend(chunk_handler(requests, per_page=12, total=120))
+    try:
+        result = await lookup._read(backend, "lookup.activity", {"target_pk": "7", "window": 50})
+    finally:
+        await backend.aclose()
+    # 50 posts at a 12-item page is 5 requests — one below the ceiling.
+    assert len(requests) == 5 < lookup.MAX_PAGE_REQUESTS
+    assert result["analyzed"] == 50
+
+
+async def test_lookup_profile_worst_case_is_four_paid_requests():
+    """Two calls, each with at most the one quick retry the policy allows."""
+    import httpx
+
+    requests = []
+
+    def handler(request):
+        requests.append(request.url.path)
+        first = requests.count(request.url.path) == 1
+        if first:
+            return httpx.Response(500, json={"detail": "provider blip"})
+        if request.url.path.endswith("/by/username"):
+            return httpx.Response(200, json={"user": {"pk": "7", "username": "alice"}})
+        return httpx.Response(
+            200,
+            json={"user": {"pk": "7", "username": "alice", "follower_count": 3}},
+            headers={"x-quota-remaining": "4199"},
+        )
+
+    backend = transport_backend(handler)
+    try:
+        result = await lookup._read(backend, "lookup.profile", {"username": "alice"})
+    finally:
+        await backend.aclose()
+    assert len(requests) == 4
+    assert requests.count("/v2/user/by/username") == 2
+    assert requests.count("/v2/user/by/id") == 2
+    assert result["target_pk"] == "7" and result["fields"]["follower_count"] == 3
+    assert result["quota_remaining"] == 4199
+
+
+async def test_a_provider_that_answers_cleanly_costs_two_requests():
+    import httpx
+
+    requests = []
+
+    def handler(request):
+        requests.append(request.url.path)
+        return httpx.Response(200, json={"user": {"pk": "7", "username": "alice"}})
+
+    backend = transport_backend(handler)
+    try:
+        await lookup._read(backend, "lookup.profile", {"username": "alice"})
+    finally:
+        await backend.aclose()
+    assert requests == ["/v2/user/by/username", "/v2/user/by/id"]
+
+
+async def test_the_fake_ceiling_is_the_one_the_lookup_asks_for(lookup_profile, constructed):
+    backend = FakeBackend(posts=[make_post(i) for i in range(4)], page=1, endless=True)
+    record = constructed(backend)
+    result = await call(lookup_profile, "lookup.activity", {"target_pk": "7", "window": 50})
+    assert record["max_pages"] == lookup.MAX_PAGE_REQUESTS
+    assert len(backend.calls) == lookup.MAX_PAGE_REQUESTS
+    assert result["analyzed"] == 4
+    assert backend.closed == 1
+
+
+# ------------------------------------------------------ honesty of the answer
+
+
+async def test_a_coordinate_json_cannot_carry_is_not_counted_as_geotagged(
+    lookup_profile, constructed
+):
+    """One NaN used to poison the centroid and radius of the whole window."""
+    posts = [
+        make_post(0, place="Cafe Zero", lat=52.37, lng=4.89),
+        make_post(1, place="Cafe Zero", lat=52.37, lng=4.89),
+        make_post(2, place="Nowhere", lat=float("nan"), lng=float("inf")),
+    ]
+    constructed(FakeBackend(posts=posts))
+    geo = (await call(lookup_profile, "lookup.activity", {"target_pk": "7", "window": 12}))["geo"]
+    assert geo["geotagged"] == 2
+    assert geo["anchor"] == {"name": "Cafe Zero", "lat": 52.37, "lng": 4.89, "count": 2}
+    assert geo["centroid"] == {"lat": 52.37, "lng": 4.89}
+    assert geo["radius_km"] == 0.0
+    assert [place["name"] for place in geo["places"]] == ["Cafe Zero"]
+
+
+async def test_no_provider_text_ever_reaches_the_wire(lookup_profile, constructed, monkeypatch):
+    from insto.desktop.dispatch import handle
+
+    monkeypatch.setenv("INSTO_DESKTOP_ROOT", str(lookup_profile.root))
+    constructed(FakeBackend(errors={"resolve": AuthInvalid("offline-token-sentinel")}))
+    raw = await handle(
+        (
+            json.dumps(
+                {
+                    "protocol_version": 1,
+                    "request_id": "leak",
+                    "operation": "lookup.profile",
+                    "params": {"username": "alice"},
+                }
+            )
+            + "\n"
+        ).encode()
+    )
+    assert b"offline-token-sentinel" not in raw
+    assert json.loads(raw)["error"] == {
+        "code": "invalid_token",
+        "message": MESSAGES["invalid_token"][0],
+        "retryable": False,
+    }
