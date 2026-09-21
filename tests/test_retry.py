@@ -218,3 +218,44 @@ async def test_args_and_kwargs_are_forwarded() -> None:
 def test_max_attempts_must_be_positive() -> None:
     with pytest.raises(ValueError):
         with_retry(max_attempts=0)
+
+
+async def test_rate_limit_retries_can_be_refused_outright() -> None:
+    """The desktop network reads fail fast: a cooldown is reported, never slept on."""
+    sleep = _SleepRecorder()
+    calls = 0
+
+    @with_retry(sleep=sleep, rng=_fixed_rng(), max_attempts=2, retry_rate_limited=False)
+    async def op() -> str:
+        nonlocal calls
+        calls += 1
+        raise RateLimited(retry_after=300.0)
+
+    with pytest.raises(RateLimited):
+        await op()
+    assert calls == 1
+    assert sleep.delays == []
+
+
+async def test_a_transient_blip_is_still_retried_once_without_rate_limit_retries() -> None:
+    sleep = _SleepRecorder()
+    calls = 0
+
+    @with_retry(
+        sleep=sleep,
+        rng=_fixed_rng(),
+        max_attempts=2,
+        base_delay=0.25,
+        max_delay=0.25,
+        retry_rate_limited=False,
+    )
+    async def op() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise Transient("blip")
+        return "ok"
+
+    assert await op() == "ok"
+    assert calls == 2
+    assert len(sleep.delays) == 1 and sleep.delays[0] <= 0.25 + 1e-9
