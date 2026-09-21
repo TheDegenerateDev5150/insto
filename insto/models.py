@@ -292,8 +292,9 @@ class Snapshot:
     banner URLs are stored as sha256 hashes only — diffing checks hash
     inequality, not URL identity. The digest covers the media identity (the
     last path segment), not the signed URL, so the same picture re-fetched
-    through another CDN edge hashes the same; see `service.history.hash_url`
-    and `media_hashes_comparable`.
+    through another CDN edge hashes the same. Which algorithm hashed a row is
+    recorded in `profile_fields` itself; see `service.history.hash_url` and
+    `media_hashes_stable`.
     """
 
     target_pk: str

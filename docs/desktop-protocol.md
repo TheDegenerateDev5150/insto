@@ -291,26 +291,28 @@ retained snapshots for that PK; one snapshot is an initial retained baseline.
 `changes` contains `{field,old,new}` for known values that differ. The field set
 is the existing tracked profile fields plus `avatar` and `banner` stored hashes.
 Absent fields are listed in `unknown_fields`; explicit JSON null is a known
-value. `avatar` and `banner` are compared only when both captures are at or
-after `_meta.media_hash_stable_since`, the moment from which a stored hash
-identifies the media itself rather than a whole signed CDN URL. Older rows hold
-digests of a URL whose host and signature were re-issued on every fetch and
-cannot be recomputed, so such a pair reports neither a change nor an
-`unknown_fields` entry for them: the hashes are not comparable, and the app must
-not present that as either a picture swap or missing data. The marker is
-read-only here; only a snapshot writer stamps it. Missing selected IDs return `snapshot_unavailable`, prompting a list
-refresh. A different PK returns `snapshot_identity_mismatch`; reversed/equal
-pair ordering returns `invalid_params`. The API does not manufacture a prior
-snapshot from null.
+value. `avatar` and `banner` report a picture change only for a comparable
+pair: both rows must have been written by an insto that hashes the media
+identity rather than the whole signed CDN URL, which each row records for
+itself. A row written by an older insto holds a digest of a URL whose host and
+signature were re-issued on every fetch and cannot be recomputed, so a pair
+with one on either side reports neither a change nor an `unknown_fields` entry
+for them: the hashes are not comparable, and the app must not present that as
+either a picture swap or missing data. Missing selected IDs return
+`snapshot_unavailable`, prompting a list refresh. A different PK returns
+`snapshot_identity_mismatch`; reversed/equal pair ordering returns
+`invalid_params`. The API does not manufacture a prior snapshot from null.
 
 `snapshots.read` returns one selected snapshot as
 `{kind:"snapshot_fields",snapshot,fields,unknown_fields}`. `snapshot` is the same
 metadata DTO the list returns. `fields` maps each tracked field the snapshot has
 to its value — the same names, the same `str`/`int`/`bool`/null typing and the
 same `avatar` and `banner` stored-hash treatment `snapshots.compare` reports in
-its `changes` values, so one formatter serves both. Absent tracked fields are
-listed in `unknown_fields` in the same order `snapshots.compare` uses; explicit
-JSON null is a known value. Its parameters are validated exactly like one side
+its `changes` values, so one formatter serves both. It is not gated the way
+`snapshots.compare` is: `snapshots.read` reports the stored digest of a single
+snapshot as it is, including for a row whose hashes no comparison could use.
+Absent tracked fields are listed in `unknown_fields` in the same order
+`snapshots.compare` uses; explicit JSON null is a known value. Its parameters are validated exactly like one side
 of the compare pair, with the same `invalid_params` code. A missing ID returns
 `snapshot_unavailable`, a snapshot of another target returns
 `snapshot_identity_mismatch`, an unreadable row returns `history_corrupt`, and a
@@ -321,9 +323,8 @@ record over the raw byte cap or a response over the wire budget returns
 snapshot within the same PK and initial ID ceiling. Its earliest retained
 snapshot is `{kind:"baseline",snapshot}`. Fully known unchanged comparisons
 are omitted, and so is a pair whose only difference would be an avatar or
-banner hash that `snapshots.compare` cannot compare across
-`media_hash_stable_since`: it yields no item at all, exactly like an unchanged
-pair. A comparison with any unknown field has `kind:"incomplete"` and
+banner hash that `snapshots.compare` would not report as a picture change:
+it yields no item at all, exactly like an unchanged pair. A comparison with any unknown field has `kind:"incomplete"` and
 the same `older,newer,changes,unknown_fields` shape. Other changed pairs have
 `kind:"comparison"`. These are observations between capture times, not exact
 Instagram event times; follower counts do not identify individual followers.

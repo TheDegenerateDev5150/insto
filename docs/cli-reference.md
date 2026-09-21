@@ -175,7 +175,7 @@ Saved commands are aiograpi-only, read-only, and support JSON/CSV export. They i
 | `/watch <user> [interval]` | Persist or explicitly reactivate a watch (≥ 5 min interval, max 3 active). With no user, uses the active target. |
 | `/unwatch <user>` | Delete a persisted watch and stop its local task. |
 | `/watching` | List persisted watches with state, last success, redacted error, and consecutive-error count. |
-| `/diff <user>` | Diff current profile vs the most recent stored snapshot. Avatar/banner report a change only when the stored snapshot is comparable — see `_meta.media_hash_stable_since` in the architecture notes. |
+| `/diff <user>` | Diff current profile vs the most recent stored snapshot. Avatar/banner report a change only when the stored snapshot is comparable — see `_media_hash_algo` in the architecture notes. |
 | `/history [N]` | Last N rows of `cli_history`. |
 
 One-shot registration exits after writing the row; it never becomes an executor:
