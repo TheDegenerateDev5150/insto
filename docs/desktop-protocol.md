@@ -538,9 +538,10 @@ same declaration order and with the same value typing — `username`, `full_name
 a stored snapshot has. A tracked field this provider cannot supply is named in
 `unknown_fields` rather than invented, so one renderer serves a lookup and a
 saved snapshot — such a renderer must treat the `avatar` and `banner` keys as
-optional, since only `snapshots.read` ever carries them. The CLI's third `user_about` request is deliberately not made:
-every field above comes from the profile payload itself, so it would buy this
-result nothing. A deleted or unknown account is `target_not_found`.
+optional, since only `snapshots.read` ever carries them. The CLI's third
+`user_about` request is deliberately not made: every field above comes from
+the profile payload itself, so it would buy this result nothing. A deleted or
+unknown account is `target_not_found`.
 
 `lookup.activity` returns `{kind:"lookup_activity", target_pk, window,
 analyzed, geo, timeline, hashtags, mentions, locations, likes,
