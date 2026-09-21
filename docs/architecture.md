@@ -70,7 +70,8 @@ Commands never `except BackendError` themselves. The dispatcher catches everythi
 All persistent state lives in one DB at `~/.insto/store.db` (mode `0600`):
 
 ```text
-_meta             schema_version
+_meta             schema_version, first_check_attempted:<user>,
+                  media_hash_stable_since
 cli_history       cmd, target, ts            (90-day retention, indexed on ts)
 watches           user, registration_id, interval_seconds, last_ok, last_error,
                   consecutive_errors, status
@@ -81,7 +82,15 @@ snapshots         target_pk, captured_at, profile_fields_json, last_post_pks_jso
 - One `sqlite3.Connection` per session, owned by the facade.
 - `asyncio.to_thread` wraps every sync call from async contexts so the event loop never blocks.
 - `migrate_to_latest()` runs on startup under `BEGIN IMMEDIATE` so two `insto` processes don't race a schema bump.
-- URLs (avatar / banner) are SHA256-hashed before write — diffing checks hash inequality, not the URL.
+- Avatar / banner URLs are SHA256-hashed before write — diffing checks hash inequality, never the URL.
+  The digest covers the media identity (the last path segment of the CDN URL), not the whole URL: the
+  edge host and the signed `oh` / `oe` / `_nc_ohc` / `stp` parameters are re-issued on every fetch, so a
+  whole-URL digest changed on every check. Rows written before that change hold whole-URL digests and
+  cannot be recomputed (the URLs are not stored), so the first writer to save a snapshot with the new
+  algorithm stamps `_meta.media_hash_stable_since`. Every comparison — `/diff`, the `/watch`
+  notification, and the desktop `snapshots.compare` / `changes.list` — reports an avatar or banner
+  difference only when both captures are at or after that moment; otherwise the pair is silently not
+  comparable. `snapshots.read` is not gated: it reports the stored digest as it is.
 
 ## Output / export
 

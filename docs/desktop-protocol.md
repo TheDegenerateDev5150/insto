@@ -291,7 +291,14 @@ retained snapshots for that PK; one snapshot is an initial retained baseline.
 `changes` contains `{field,old,new}` for known values that differ. The field set
 is the existing tracked profile fields plus `avatar` and `banner` stored hashes.
 Absent fields are listed in `unknown_fields`; explicit JSON null is a known
-value. Missing selected IDs return `snapshot_unavailable`, prompting a list
+value. `avatar` and `banner` are compared only when both captures are at or
+after `_meta.media_hash_stable_since`, the moment from which a stored hash
+identifies the media itself rather than a whole signed CDN URL. Older rows hold
+digests of a URL whose host and signature were re-issued on every fetch and
+cannot be recomputed, so such a pair reports neither a change nor an
+`unknown_fields` entry for them: the hashes are not comparable, and the app must
+not present that as either a picture swap or missing data. The marker is
+read-only here; only a snapshot writer stamps it. Missing selected IDs return `snapshot_unavailable`, prompting a list
 refresh. A different PK returns `snapshot_identity_mismatch`; reversed/equal
 pair ordering returns `invalid_params`. The API does not manufacture a prior
 snapshot from null.
@@ -313,7 +320,10 @@ record over the raw byte cap or a response over the wire budget returns
 `changes.list` compares each candidate with its immediately preceding retained
 snapshot within the same PK and initial ID ceiling. Its earliest retained
 snapshot is `{kind:"baseline",snapshot}`. Fully known unchanged comparisons
-are omitted. A comparison with any unknown field has `kind:"incomplete"` and
+are omitted, and so is a pair whose only difference would be an avatar or
+banner hash that `snapshots.compare` cannot compare across
+`media_hash_stable_since`: it yields no item at all, exactly like an unchanged
+pair. A comparison with any unknown field has `kind:"incomplete"` and
 the same `older,newer,changes,unknown_fields` shape. Other changed pairs have
 `kind:"comparison"`. These are observations between capture times, not exact
 Instagram event times; follower counts do not identify individual followers.
