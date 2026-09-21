@@ -91,9 +91,16 @@ delete it. A successful tick clears the stored error counter.
 On startup the daemon reports its sqlite path, recovered count, estimated
 ticks/backend calls per hour, and the relevant quota/cost (HikerAPI) or
 rate-limit/account (aiograpi) risk. At the minimum interval, three watches mean
-36 ticks/hour and an estimated 72-108 backend calls/hour. Recovered overdue
-targets are staggered by two seconds, and each target uses fixed-delay polling,
-so slow calls never overlap or create catch-up bursts.
+36 ticks/hour and an estimated 72-108 backend calls/hour. A newly added,
+never-checked watch is checked at once by `insto watch-daemon` and by the
+managed service, so the first result does not wait a full interval; that costs
+one extra tick per registration and never more, because the attempt is recorded
+before it runs. A watch that has already failed, or that has already been
+granted its immediate check, waits a full interval — editing the interval,
+pausing and resuming, or restarting the daemon buys no further check. The REPL
+executor still waits one interval before its first tick. Recovered overdue
+targets and immediate first checks are staggered by two seconds, and each target
+uses fixed-delay polling, so slow calls never overlap or create catch-up bursts.
 
 The daemon applies retention on startup and hourly: command history older than
 90 days and snapshots older than 30 days are removed, keeping at most 100

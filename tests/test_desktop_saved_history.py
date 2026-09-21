@@ -1,7 +1,7 @@
 import json
 import sqlite3
 import time
-from contextlib import closing
+from contextlib import closing, contextmanager
 
 import pytest
 
@@ -84,6 +84,155 @@ def test_compare_same_pk_retention_and_chronological_order(monitoring_profile):
         db.execute("DELETE FROM snapshots WHERE id=?", (first,))
     with pytest.raises(DesktopError, match="snapshot_unavailable"):
         request(p, "snapshots.compare", params)
+
+
+def test_read_reports_the_same_fields_and_typing_as_compare(monitoring_profile):
+    p = monitoring_profile
+    avatar, banner = "a" * 64, "b" * 64
+    payload = fields(
+        full_name="Alice",
+        external_url=None,
+        is_verified=True,
+        is_business=False,
+        is_private=False,
+        follower_count=3,
+        following_count=4,
+        media_count=5,
+    )
+    identifier = insert(p, stamp=2, payload=payload)
+    with closing(sqlite3.connect(p.home / "store.db")) as db, db:
+        db.execute(
+            "UPDATE snapshots SET avatar_url_hash=?, banner_url_hash=? WHERE id=?",
+            (avatar, banner, identifier),
+        )
+    result = request(p, "snapshots.read", {"target_pk": "7", "snapshot_id": identifier})
+    assert result == {
+        "kind": "snapshot_fields",
+        "snapshot": {"id": identifier, "target_pk": "7", "captured_at": 2},
+        "fields": {
+            "username": "alice",
+            "full_name": "Alice",
+            "biography": "",
+            "external_url": None,
+            "is_verified": True,
+            "is_business": False,
+            "is_private": False,
+            "follower_count": 3,
+            "following_count": 4,
+            "media_count": 5,
+            "public_email": None,
+            "public_phone": None,
+            "business_category": None,
+            "avatar": avatar,
+            "banner": banner,
+        },
+        "unknown_fields": [],
+    }
+    # The same names, the same values and the same hash treatment `compare` uses,
+    # so the app can reuse one formatter for both.
+    empty = insert(p, stamp=1, payload=dict.fromkeys(_PROFILE_TRACKED_FIELDS, None))
+    difference = request(
+        p, "snapshots.compare", {"target_pk": "7", "older_id": empty, "newer_id": identifier}
+    )
+    reported = {change["field"]: change["new"] for change in difference["changes"]}
+    assert reported == {
+        name: value for name, value in result["fields"].items() if value is not None
+    }
+
+
+def test_read_lists_unknown_fields_of_an_old_snapshot_in_compare_order(monitoring_profile):
+    p = monitoring_profile
+    identifier = insert(p, payload={"biography": None, "full_name": "Alice"})
+    result = request(p, "snapshots.read", {"target_pk": "7", "snapshot_id": identifier})
+    assert result["fields"] == {
+        "full_name": "Alice",
+        "biography": None,
+        "avatar": None,
+        "banner": None,
+    }
+    assert result["unknown_fields"] == [
+        "username",
+        "external_url",
+        "is_verified",
+        "is_business",
+        "is_private",
+        "follower_count",
+        "following_count",
+        "media_count",
+        "public_email",
+        "public_phone",
+        "business_category",
+    ]
+    # `compare` sorts the same way: the tracked declaration order.
+    newer = insert(p, stamp=2, payload={"biography": None, "full_name": "Alice"})
+    difference = request(
+        p, "snapshots.compare", {"target_pk": "7", "older_id": identifier, "newer_id": newer}
+    )
+    assert difference["unknown_fields"] == result["unknown_fields"]
+
+
+def test_read_rejects_a_missing_foreign_or_unreadable_snapshot(monitoring_profile):
+    p = monitoring_profile
+    identifier = insert(p, stamp=1)
+    foreign = insert(p, pk="8", stamp=2)
+    corrupt = insert(p, stamp=3, payload="{private-old-token")
+    with pytest.raises(DesktopError, match="snapshot_identity_mismatch"):
+        request(p, "snapshots.read", {"target_pk": "7", "snapshot_id": foreign})
+    with pytest.raises(DesktopError, match="history_corrupt") as caught:
+        request(p, "snapshots.read", {"target_pk": "7", "snapshot_id": corrupt})
+    assert "private-old-token" not in str(caught.value)
+    with closing(sqlite3.connect(p.home / "store.db")) as db, db:
+        db.execute("DELETE FROM snapshots WHERE id=?", (identifier,))
+    with pytest.raises(DesktopError, match="snapshot_unavailable"):
+        request(p, "snapshots.read", {"target_pk": "7", "snapshot_id": identifier})
+    with pytest.raises(DesktopError, match="snapshot_unavailable"):
+        request(p, "snapshots.read", {"target_pk": "7", "snapshot_id": "9223372036854775807"})
+
+
+def test_read_refuses_an_oversized_snapshot(monitoring_profile):
+    p = monitoring_profile
+    identifier = insert(p, payload=json.dumps({"biography": "界" * 24000}, ensure_ascii=False))
+    with pytest.raises(DesktopError, match="history_oversized"):
+        request(p, "snapshots.read", {"target_pk": "7", "snapshot_id": identifier})
+
+
+def test_read_never_opens_the_store_for_writing(monitoring_profile, monkeypatch):
+    p = monitoring_profile
+    identifier = insert(p)
+    from insto.desktop import database
+    from insto.desktop import history as desktop_history
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("snapshots.read must not open the store for writing")
+
+    monkeypatch.setattr(database, "write_database", forbidden)
+    monkeypatch.setattr(desktop_history, "write_database", forbidden, raising=False)
+    modes: list[int] = []
+    real = desktop_history.read_database
+
+    @contextmanager
+    def spy(profile, *, deadline):
+        with real(profile, deadline=deadline) as connection:
+            modes.append(connection.execute("PRAGMA query_only").fetchone()[0])
+            yield connection
+
+    monkeypatch.setattr(desktop_history, "read_database", spy)
+    assert request(p, "snapshots.read", {"target_pk": "7", "snapshot_id": identifier})["kind"] == (
+        "snapshot_fields"
+    )
+    assert modes == [1]
+
+
+def test_read_honours_the_cooperative_deadline(monitoring_profile):
+    p = monitoring_profile
+    identifier = insert(p)
+    with pytest.raises(DesktopError, match="operation_timeout"):
+        run(
+            p,
+            "snapshots.read",
+            validate_params("snapshots.read", {"target_pk": "7", "snapshot_id": identifier}),
+            deadline=time.monotonic() - 1,
+        )
 
 
 def test_unknown_fields_are_incomplete_not_fabricated_changes(monitoring_profile):

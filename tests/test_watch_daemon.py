@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import threading
 import time
-from collections.abc import Callable, Generator
+from collections.abc import AsyncIterator, Callable, Generator
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -17,9 +20,11 @@ from insto.service.history import HistoryStore
 from insto.service.watch import TickFn, WatchManager
 from insto.service.watch_daemon import (
     WatchDaemon,
+    WatchExecutorRole,
     estimate_watch_load,
     initial_watch_delay,
     startup_offsets,
+    wants_first_check_now,
 )
 from insto.service.watch_lock import WatchProcessLock
 
@@ -49,6 +54,21 @@ def _ticks(calls: list[str]) -> Callable[[str], TickFn]:
         return tick
 
     return factory
+
+
+def _already_checked(store: HistoryStore, user: str, interval: int = 300) -> WatchSpec:
+    """Register a watch that the daemon must not check immediately.
+
+    The headless daemon gives a clean never-checked registration a zero first
+    delay, so a test about anything else records one success first and keeps a
+    full interval before the scheduled loop would tick.
+    """
+    spec = store.register_watch(user, interval).spec
+    assert spec is not None
+    assert store.update_watch_state(spec, last_ok=int(time.time()))
+    checked = store.get_watch(user)
+    assert checked is not None
+    return checked
 
 
 def _persist_state(
@@ -99,6 +119,342 @@ def test_initial_delay_and_startup_offsets_are_deterministic() -> None:
         "bob": 2.0,
         "dave": 250.0,
     }
+
+
+def test_first_check_is_immediate_only_for_a_clean_new_registration() -> None:
+    fresh = WatchSpec("carol", "c", 300)
+    failed = WatchSpec("dave", "d", 300, last_error="boom", consecutive_errors=1)
+    counted = WatchSpec("erin", "e", 300, consecutive_errors=1)
+    recorded = WatchSpec("frank", "f", 300, last_error="boom")
+
+    assert wants_first_check_now(fresh) is True
+    assert wants_first_check_now(failed) is False
+    assert wants_first_check_now(counted) is False
+    assert wants_first_check_now(recorded) is False
+    assert wants_first_check_now(WatchSpec("gina", "g", 300, last_ok=900)) is False
+    # A recorded grant is the second, durable half of the rule.
+    assert wants_first_check_now(fresh, attempted={"carol"}) is False
+    assert wants_first_check_now(fresh, attempted={"someone-else"}) is True
+
+    # Daemon role: a clean new row goes now, a failed one waits a full interval.
+    assert initial_watch_delay(fresh, now=1_000, first_check_now=True) == 0.0
+    assert initial_watch_delay(failed, now=1_000, first_check_now=True) == 300
+    assert initial_watch_delay(counted, now=1_000, first_check_now=True) == 300
+    assert initial_watch_delay(recorded, now=1_000, first_check_now=True) == 300
+    # A recorded success is unaffected by the daemon flag.
+    assert initial_watch_delay(WatchSpec("gina", "g", 300, last_ok=950), now=1_000) == 250
+    assert (
+        initial_watch_delay(
+            WatchSpec("gina", "g", 300, last_ok=950), now=1_000, first_check_now=True
+        )
+        == 250
+    )
+    # The REPL role keeps today's behaviour exactly.
+    assert initial_watch_delay(fresh, now=1_000) == 300
+    assert initial_watch_delay(failed, now=1_000) == 300
+
+
+def test_recovery_staggers_several_never_checked_registrations() -> None:
+    specs = [
+        WatchSpec("carol", "c", 300),
+        WatchSpec("alice", "a", 300),
+        WatchSpec("bob", "b", 300),
+        WatchSpec("dave", "d", 300, last_error="boom", consecutive_errors=1),
+        WatchSpec("erin", "e", 300, last_ok=600),
+    ]
+    assert startup_offsets(specs, now=1_000, granted={"alice", "bob", "carol", "dave"}) == {
+        "alice": 0.0,
+        "bob": 2.0,
+        "carol": 4.0,
+        # A granted user that already failed still keeps its interval.
+        "dave": 300.0,
+        "erin": 6.0,
+    }
+    assert startup_offsets(specs, now=1_000) == {
+        "alice": 300.0,
+        "bob": 300.0,
+        "carol": 300.0,
+        "dave": 300.0,
+        "erin": 0.0,
+    }
+
+
+def _recording_manager(
+    history: HistoryStore, recorded: dict[str, float], *, repl: bool = False
+) -> WatchManager:
+    manager = _manager(history, repl=repl)
+    original = manager.add
+
+    def add(spec: WatchSpec, **kwargs: Any) -> WatchSpec:
+        recorded[spec.user] = float(kwargs["initial_delay"])
+        return original(spec, **kwargs)
+
+    manager.add = add  # type: ignore[method-assign]
+    return manager
+
+
+async def _reconciled_delays(
+    history: HistoryStore, role: WatchExecutorRole, users: list[str]
+) -> dict[str, float]:
+    recorded: dict[str, float] = {}
+    manager = _recording_manager(history, recorded, repl=role == "repl")
+    daemon = WatchDaemon(
+        history=history,
+        manager=manager,
+        tick_factory=_ticks([]),
+        role=role,
+        now=lambda: 1_000,
+    )
+    try:
+        await daemon.start()
+        # Adding after start exercises the steady-state reconcile path, which is
+        # what a user adding their first account in the GUI actually hits.
+        for user in users:
+            assert history.register_watch(user, 300).spec is not None
+        await daemon.reconcile_once()
+    finally:
+        await daemon.stop()
+        if manager.executor_acquired:
+            manager.release_executor()
+    return recorded
+
+
+async def test_daemon_checks_a_new_registration_right_away(history: HistoryStore) -> None:
+    assert await _reconciled_delays(history, "daemon", ["alice"]) == {"alice": 0.0}
+
+
+async def test_repl_keeps_the_full_interval_before_a_first_check(history: HistoryStore) -> None:
+    assert await _reconciled_delays(history, "repl", ["alice"]) == {"alice": 300.0}
+
+
+async def test_daemon_keeps_the_interval_for_a_failed_new_registration(
+    history: HistoryStore,
+) -> None:
+    spec = history.register_watch("alice", 300).spec
+    assert spec is not None
+    assert history.update_watch_state(spec, last_error="boom", consecutive_errors=1)
+    recorded: dict[str, float] = {}
+    manager = _recording_manager(history, recorded)
+    daemon = WatchDaemon(
+        history=history,
+        manager=manager,
+        tick_factory=_ticks([]),
+        role="daemon",
+        now=lambda: 1_000,
+    )
+    try:
+        await daemon.start()
+    finally:
+        await daemon.stop()
+        manager.release_executor()
+    assert recorded == {"alice": 300.0}
+
+
+async def test_daemon_recovery_staggers_clean_new_registrations(history: HistoryStore) -> None:
+    for user in ("carol", "alice", "bob"):
+        assert history.register_watch(user, 300).spec is not None
+    recorded: dict[str, float] = {}
+    manager = _recording_manager(history, recorded)
+    daemon = WatchDaemon(
+        history=history,
+        manager=manager,
+        tick_factory=_ticks([]),
+        role="daemon",
+        now=lambda: 1_000,
+    )
+    try:
+        await daemon.start()
+    finally:
+        await daemon.stop()
+        manager.release_executor()
+    assert recorded == {"alice": 0.0, "bob": 2.0, "carol": 4.0}
+
+
+async def test_daemon_staggers_several_immediate_grants_in_one_reconcile(
+    history: HistoryStore,
+) -> None:
+    recorded: dict[str, float] = {}
+    async with _running_daemon(history, recorded) as daemon:
+        for user in ("carol", "alice", "bob"):
+            assert history.register_watch(user, 300).spec is not None
+        await daemon.reconcile_once()
+    assert recorded == {"alice": 0.0, "bob": 2.0, "carol": 4.0}
+
+
+@asynccontextmanager
+async def _running_daemon(
+    history: HistoryStore,
+    recorded: dict[str, float],
+    *,
+    role: WatchExecutorRole = "daemon",
+) -> AsyncIterator[WatchDaemon]:
+    manager = _recording_manager(history, recorded, repl=role == "repl")
+    daemon = WatchDaemon(
+        history=history,
+        manager=manager,
+        tick_factory=_ticks([]),
+        role=role,
+        now=lambda: 1_000,
+    )
+    try:
+        await daemon.start()
+        yield daemon
+    finally:
+        await daemon.stop()
+        if manager.executor_acquired:
+            manager.release_executor()
+
+
+def _mutate(store: HistoryStore, action: str, user: str, *, interval: int | None = None) -> None:
+    """Drive the real desktop mutation, which always rotates `registration_id`."""
+    from insto.service import watch_registry
+
+    with store._lock:
+        connection = store._conn
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            revision = watch_registry.public_row(watch_registry.lookup(connection, user))[
+                "revision"
+            ]
+            watch_registry.mutate(connection, action, user, revision, interval=interval)
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+
+
+async def _granted_then(
+    history: HistoryStore, user: str, steps: Callable[[], None]
+) -> dict[str, float]:
+    """Grant the first check, then apply `steps` and reconcile once more."""
+    recorded: dict[str, float] = {}
+    async with _running_daemon(history, recorded) as daemon:
+        assert history.register_watch(user, 300).spec is not None
+        await daemon.reconcile_once()
+        assert recorded == {user: 0.0}
+        assert history.first_check_attempts() == {user}
+        recorded.clear()
+        steps()
+        await daemon.reconcile_once()
+    return recorded
+
+
+async def test_an_interval_edit_does_not_buy_a_second_immediate_check(
+    history: HistoryStore,
+) -> None:
+    recorded = await _granted_then(
+        history, "alice", lambda: _mutate(history, "update", "alice", interval=600)
+    )
+    assert recorded == {"alice": 600.0}
+
+
+async def test_pause_and_resume_does_not_buy_a_second_immediate_check(
+    history: HistoryStore,
+) -> None:
+    def steps() -> None:
+        _mutate(history, "pause", "alice")
+        _mutate(history, "resume", "alice")
+
+    assert await _granted_then(history, "alice", steps) == {"alice": 300.0}
+
+
+async def test_pause_and_resume_cannot_launder_away_a_failed_first_check(
+    history: HistoryStore,
+) -> None:
+    # `resume` clears last_error/consecutive_errors, so the persisted-failure
+    # guard alone would hand this row another paid check; the marker does not.
+    def steps() -> None:
+        spec = history.get_watch("alice")
+        assert spec is not None
+        assert history.update_watch_state(spec, last_error="boom", consecutive_errors=1)
+        _mutate(history, "pause", "alice")
+        _mutate(history, "resume", "alice")
+
+    assert await _granted_then(history, "alice", steps) == {"alice": 300.0}
+
+
+async def test_a_daemon_restart_does_not_repeat_an_unfinished_first_check(
+    history: HistoryStore,
+) -> None:
+    first: dict[str, float] = {}
+    async with _running_daemon(history, first) as daemon:
+        assert history.register_watch("alice", 300).spec is not None
+        await daemon.reconcile_once()
+    assert first == {"alice": 0.0}
+    # The tick never completed, so the row is still clean; a new daemon over the
+    # same store must not spend quota again.
+    spec = history.get_watch("alice")
+    assert spec is not None and spec.last_ok is None and spec.last_error is None
+    second: dict[str, float] = {}
+    async with _running_daemon(history, second):
+        pass
+    assert second == {"alice": 300.0}
+
+
+async def test_removing_and_adding_a_watch_is_checked_promptly_again(
+    history: HistoryStore,
+) -> None:
+    recorded: dict[str, float] = {}
+    async with _running_daemon(history, recorded) as daemon:
+        assert history.register_watch("alice", 300).spec is not None
+        await daemon.reconcile_once()
+        assert recorded == {"alice": 0.0}
+        assert history.delete_watch("alice")
+        recorded.clear()
+        # One reconcile observes the departed row and forgets its marker.
+        await daemon.reconcile_once()
+        assert recorded == {} and history.first_check_attempts() == set()
+        assert history.register_watch("alice", 300).spec is not None
+        await daemon.reconcile_once()
+    assert recorded == {"alice": 0.0}
+
+
+async def test_a_marker_that_cannot_be_written_means_no_immediate_check(
+    history: HistoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def failing_mark(user: str) -> None:
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(history, "mark_first_check_attempted_async", failing_mark)
+    ticks: list[str] = []
+    recorded: dict[str, float] = {}
+    manager = _recording_manager(history, recorded)
+    daemon = WatchDaemon(
+        history=history,
+        manager=manager,
+        tick_factory=_ticks(ticks),
+        role="daemon",
+        now=lambda: 1_000,
+    )
+    try:
+        await daemon.start()
+        assert history.register_watch("alice", 300).spec is not None
+        await daemon.reconcile_once()
+        await asyncio.sleep(0)
+    finally:
+        await daemon.stop()
+        manager.release_executor()
+    assert recorded == {"alice": 300.0}
+    assert ticks == []
+
+
+async def test_the_repl_never_reads_or_writes_first_check_markers(
+    history: HistoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("the REPL role must not touch first-check markers")
+
+    for name in (
+        "first_check_attempts_async",
+        "mark_first_check_attempted_async",
+        "forget_first_check_attempt_async",
+    ):
+        monkeypatch.setattr(history, name, forbidden)
+    recorded: dict[str, float] = {}
+    async with _running_daemon(history, recorded, role="repl") as daemon:
+        assert history.register_watch("alice", 300).spec is not None
+        await daemon.reconcile_once()
+    assert recorded == {"alice": 300.0}
 
 
 def test_estimate_watch_load_bounds_backend_calls() -> None:
@@ -268,8 +624,7 @@ async def test_repeated_startup_cancellation_drains_prune_before_releasing_execu
 
 
 async def test_reconcile_add_remove_pause_and_replace(history: HistoryStore) -> None:
-    alice = history.register_watch("alice", 300).spec
-    assert alice is not None
+    alice = _already_checked(history, "alice")
     manager = _manager(history)
     daemon = WatchDaemon(
         history=history,
@@ -279,8 +634,7 @@ async def test_reconcile_add_remove_pause_and_replace(history: HistoryStore) -> 
     )
     await daemon.start()
 
-    bob = history.register_watch("bob", 600).spec
-    assert bob is not None
+    _already_checked(history, "bob", 600)
     await daemon.reconcile_once()
     assert [spec.user for spec in manager.list()] == ["alice", "bob"]
 
@@ -394,7 +748,7 @@ async def test_failed_tick_is_redacted_in_state_and_executor_output(
 ) -> None:
     secret = "watch-secret-123456"
     register_secret(secret)
-    assert history.register_watch("alice", 300).spec is not None
+    _already_checked(history, "alice")
     messages: list[str] = []
 
     def failing_tick_factory(user: str) -> TickFn:
@@ -425,7 +779,7 @@ async def test_failed_tick_is_redacted_in_state_and_executor_output(
 
 
 async def test_state_output_failure_does_not_stop_executor(history: HistoryStore) -> None:
-    assert history.register_watch("alice", 300).spec is not None
+    _already_checked(history, "alice")
 
     def failing_tick_factory(user: str) -> TickFn:
         async def tick() -> None:

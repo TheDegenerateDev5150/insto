@@ -392,6 +392,39 @@ async def test_watch_registry_async_wrappers(store: HistoryStore) -> None:
     assert await store.delete_watch_async("ALICE") is True
 
 
+def test_first_check_markers_are_canonical_meta_rows_without_a_schema_bump(
+    store: HistoryStore,
+) -> None:
+    before = store.schema_version()
+    assert store.first_check_attempts() == set()
+    store.mark_first_check_attempted("@ALICE")
+    store.mark_first_check_attempted("bob")
+    assert store.first_check_attempts() == {"alice", "bob"}
+    # Recording twice is idempotent, so a repeated reconcile cannot duplicate.
+    store.mark_first_check_attempted("alice")
+    assert store.first_check_attempts() == {"alice", "bob"}
+    assert store.forget_first_check_attempt("ALICE") is True
+    assert store.forget_first_check_attempt("alice") is False
+    assert store.first_check_attempts() == {"bob"}
+    # The markers are ordinary `_meta` rows and leave `schema_version` alone, so
+    # the pinned desktop protocol still sees the schema version it supports.
+    assert store.schema_version() == before
+    with store._lock:
+        rows = dict(store._conn.execute("SELECT key, value FROM _meta").fetchall())
+    assert set(rows) == {"schema_version", "first_check_attempted:bob"}
+    assert rows["schema_version"] == str(before)
+    assert rows["first_check_attempted:bob"].isdigit()
+    with pytest.raises(ValueError, match="username"):
+        store.mark_first_check_attempted("../alice")
+
+
+async def test_first_check_marker_async_wrappers(store: HistoryStore) -> None:
+    await store.mark_first_check_attempted_async("Alice")
+    assert await store.first_check_attempts_async() == {"alice"}
+    assert await store.forget_first_check_attempt_async("@alice") is True
+    assert await store.first_check_attempts_async() == set()
+
+
 def test_prune_drops_old_history(store: HistoryStore) -> None:
     # Insert one fresh and one ancient row directly.
     store.record_command("/info", "@fresh")

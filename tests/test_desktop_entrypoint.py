@@ -28,6 +28,7 @@ EXACT_CAPABILITIES = [
     "snapshots.targets",
     "snapshots.list",
     "snapshots.compare",
+    "snapshots.read",
     "changes.list",
     "service.inspect",
     "service.migrate",

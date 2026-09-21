@@ -208,6 +208,33 @@ def comparison(old: SavedSnapshot, new: SavedSnapshot, check: Check) -> dict[str
     }
 
 
+def snapshot_fields(current: SavedSnapshot, check: Check) -> dict[str, Any]:
+    """One snapshot's tracked values, typed exactly as `comparison` reports them.
+
+    The field set, the value typing and the avatar/banner hash treatment match
+    `comparison`, and `unknown_fields` keeps the same declaration order, so a
+    caller can reuse one formatter for a comparison and for a single snapshot.
+    """
+    check()
+    fields: dict[str, Any] = {}
+    unknown: list[str] = []
+    for field in _PROFILE_TRACKED_FIELDS:
+        check()
+        if field not in current.fields:
+            unknown.append(field)
+        else:
+            fields[field] = current.fields[field]
+    for field in ("avatar", "banner"):
+        fields[field] = getattr(current, field)
+    check()
+    return {
+        "kind": "snapshot_fields",
+        "snapshot": current.meta.dto(),
+        "fields": fields,
+        "unknown_fields": unknown,
+    }
+
+
 def scan_sql(
     ceiling: int,
     frontier: tuple[int, int] | None,

@@ -33,6 +33,7 @@ CAPABILITIES = [
     "snapshots.targets",
     "snapshots.list",
     "snapshots.compare",
+    "snapshots.read",
     "changes.list",
     "service.inspect",
     "service.migrate",
@@ -68,7 +69,7 @@ def forbid_import(monkeypatch, name):
 async def test_exact_c2_capabilities():
     response = json.loads(await handle(wire("hello", {})))
     assert response["result"]["capabilities"] == list(CAPABILITIES)
-    assert len(CAPABILITIES) == 24
+    assert len(CAPABILITIES) == 25
     assert list(CAPABILITIES[-5:]) == C3_CAPABILITIES
 
 

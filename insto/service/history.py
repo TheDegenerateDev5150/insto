@@ -21,7 +21,10 @@ Three tables hold session state:
   diffing renames / bio edits / pfp swaps. Pruned to 30 days *and* a max of
   100 rows per target_pk.
 
-A `_meta(key, value)` table carries `schema_version`. Ordered entries in
+A `_meta(key, value)` table carries `schema_version` and the daemon's
+`first_check_attempted:<user>` markers (see `watch_daemon`). It is a generic
+key/value store created in every schema version, so a marker needs no column and
+no migration. Ordered entries in
 `_MIGRATIONS` advance older stores to `_SCHEMA_VERSION`. Migration runs under
 `BEGIN IMMEDIATE` so a second insto process attempting the same migration
 blocks on the SQLite write lock and then re-checks the version (no-op
@@ -99,6 +102,12 @@ _LOCK_RETRY_DELAYS_MS: tuple[int, ...] = (100, 250, 500)
 CLI_HISTORY_RETENTION_DAYS = 90
 SNAPSHOT_RETENTION_DAYS = 30
 SNAPSHOT_MAX_PER_TARGET = 100
+
+# `_meta` key prefix for "the daemon already granted this user an immediate first
+# check". It is deliberately not a schema column: `_meta` is a generic key/value
+# table present in every schema version, so this records no migration and leaves
+# `schema_version` where the pinned desktop protocol expects it.
+_FIRST_CHECK_KEY = "first_check_attempted:"
 
 _PROFILE_TRACKED_FIELDS: tuple[str, ...] = (
     "username",
@@ -577,6 +586,58 @@ class HistoryStore:
 
     async def delete_watch_async(self, user: str) -> bool:
         return await asyncio.to_thread(self.delete_watch, user)
+
+    # -------------------------------------------------------- first-check markers
+
+    def first_check_attempts(self) -> set[str]:
+        """Users whose immediate first check the daemon has already scheduled.
+
+        The markers live in the generic `_meta` key/value table, which exists in
+        every schema version, so recording them needs no migration and leaves
+        `schema_version` alone for the pinned desktop protocol.
+        """
+        with self._lock:
+            rows = self._conn.execute("SELECT key FROM _meta").fetchall()
+        return {
+            str(row["key"]).removeprefix(_FIRST_CHECK_KEY)
+            for row in rows
+            if str(row["key"]).startswith(_FIRST_CHECK_KEY)
+        }
+
+    async def first_check_attempts_async(self) -> set[str]:
+        return await asyncio.to_thread(self.first_check_attempts)
+
+    def mark_first_check_attempted(self, user: str) -> None:
+        """Record the grant durably before a paid check is ever scheduled."""
+        canonical = _canonical_watch_user(user)
+
+        def _do() -> None:
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO _meta(key, value) VALUES(?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (_FIRST_CHECK_KEY + canonical, str(_now_ts())),
+                )
+
+        _with_lock_retry(_do)
+
+    async def mark_first_check_attempted_async(self, user: str) -> None:
+        await asyncio.to_thread(self.mark_first_check_attempted, user)
+
+    def forget_first_check_attempt(self, user: str) -> bool:
+        canonical = _canonical_watch_user(user)
+
+        def _do() -> int:
+            with self._lock:
+                cur = self._conn.execute(
+                    "DELETE FROM _meta WHERE key = ?", (_FIRST_CHECK_KEY + canonical,)
+                )
+                return cur.rowcount
+
+        return _with_lock_retry(_do) > 0
+
+    async def forget_first_check_attempt_async(self, user: str) -> bool:
+        return await asyncio.to_thread(self.forget_first_check_attempt, user)
 
     # ----------------------------------------------------------------- retention
 
