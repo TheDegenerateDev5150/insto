@@ -45,6 +45,7 @@ def make_backend(
     *,
     proxy: str | None = None,
     retry_decorator: RetryDecorator | None = None,
+    max_pages: int | None = None,
 ) -> HikerBackend:
     """Adapt the pinned SDK constructor without mutating process environment.
 
@@ -55,9 +56,11 @@ def make_backend(
 
     `proxy` is the profile's own configured proxy (an adopted CLI home may
     carry one); it is validated by the backend's own rule before the SDK is
-    built. `retry_decorator` replaces the default five-attempt ladder for
-    callers whose budget cannot absorb it. The returned object is the full
-    `HikerBackend`; `AccessBackend` is the part credential validation uses.
+    built. `retry_decorator` replaces the default five-attempt ladder and
+    `max_pages` the default page ceiling, for callers whose budget cannot
+    absorb either; both keep the backend's own defaults when omitted, so no
+    other caller changes. The returned object is the full `HikerBackend`;
+    `AccessBackend` is the part credential validation uses.
     """
     import hikerapi
     import httpx
@@ -81,7 +84,11 @@ def make_backend(
                 proxy=proxy,
             )
 
-    return HikerBackend(client=DesktopClient(), retry_decorator=retry_decorator)
+    if max_pages is None:
+        return HikerBackend(client=DesktopClient(), retry_decorator=retry_decorator)
+    return HikerBackend(
+        client=DesktopClient(), retry_decorator=retry_decorator, max_pages=max_pages
+    )
 
 
 async def _await_worker(

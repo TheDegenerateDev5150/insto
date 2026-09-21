@@ -8,6 +8,10 @@ possible network surface:
   token; no database is opened, no `cli_history` row is written, no snapshot is
   saved and nothing is created under `output/`. A lookup therefore runs happily
   beside a watch daemon owned by the same profile: neither takes a lock.
+- **A ceiling on paid requests, not only on time.** `lookup.profile` buys 2
+  requests (4 if both are retried once); `lookup.activity` buys at most
+  `MAX_PAGE_REQUESTS` pages however long the provider's cursor goes on, and
+  answers with what it already paid for rather than spending past the cap.
 - **One budget, fail fast.** 60 seconds covers the whole request including the
   client close, the worker is cancelled at the deadline exactly as credential
   validation cancels its own, and the retry ladder is replaced by a single
@@ -23,19 +27,22 @@ from __future__ import annotations
 import asyncio
 import math
 from collections.abc import AsyncIterator, Iterable
+from dataclasses import replace
 from typing import Any, Protocol
 
 from insto.backends._retry import with_retry
-from insto.desktop.access import _await_worker, _close, access_code, make_backend
+from insto.desktop.access import RetryDecorator, _await_worker, _close, access_code, make_backend
 from insto.desktop.configuration import parse_profile_config
 from insto.desktop.errors import DesktopError
 from insto.desktop.history_params import _PK, MAX_TIME
 from insto.desktop.profile import Profile
 from insto.exceptions import (
     Banned,
+    PageBudgetExceeded,
     ProfileDeleted,
     ProfileNotFound,
     ProfilePrivate,
+    SchemaDrift,
 )
 from insto.models import Post, Quota
 from insto.models import Profile as ProfileDTO
@@ -47,6 +54,11 @@ from insto.service.history import _PROFILE_TRACKED_FIELDS
 NETWORK_READ_SECONDS = 60.0
 CLOSE_RESERVE_SECONDS = 2.0
 TRANSIENT_RETRY_SECONDS = 0.25
+# A hard ceiling on PAID page requests, independent of the deadline: a cursor
+# that keeps offering thin or empty pages must not keep spending. Six covers
+# the largest window (50) at any page of nine items or more; past it the
+# analysis answers with what was already paid for and `analyzed` says so.
+MAX_PAGE_REQUESTS = 6
 
 MAX_COUNT = 9007199254740991
 _TERM_CHARACTERS = 120
@@ -81,7 +93,7 @@ class LookupBackend(Protocol):
     async def aclose(self) -> None: ...
 
 
-def _fail_fast() -> Any:
+def _fail_fast() -> RetryDecorator:
     """One quick retry of a transient failure, and never a rate-limit sleep.
 
     `insto.backends._retry` stays the single place that decides how a backend
@@ -113,12 +125,20 @@ def _failure(exc: BaseException) -> DesktopError:
         return exc
     if isinstance(exc, (ProfileNotFound, ProfileDeleted)):
         return DesktopError("target_not_found")
-    if isinstance(exc, (ProfilePrivate, Banned)):
-        # `Banned` is this backend's 403: Instagram itself refused the read for
-        # this target (login-walled or restricted). On a public lookup surface
-        # that is the private-account answer, not a credential problem — 401
-        # remains the only "your access is wrong" signal.
+    if isinstance(exc, ProfilePrivate):
         return DesktopError("target_private")
+    if isinstance(exc, Banned):
+        # A bare provider 403. It may be the target (restricted, region-locked,
+        # login-walled) or this account's own access; the provider does not say
+        # which, so neither does this answer. Never `target_private`: telling a
+        # user with a disabled plan that the account is private sends them to
+        # pay for the same refusal on another account.
+        return DesktopError("target_unavailable")
+    if isinstance(exc, SchemaDrift):
+        # A payload this core cannot read is a permanent property of the
+        # answer, not a passing provider condition; retrying costs the same
+        # requests for the same failure.
+        return DesktopError("provider_response_invalid")
     return DesktopError(access_code(exc))
 
 
@@ -135,7 +155,12 @@ async def run(profile: Profile, operation: str, params: dict[str, Any]) -> dict[
     failure: BaseException | None = None
     result: dict[str, Any] | None = None
     try:
-        backend = make_backend(token, proxy=proxy, retry_decorator=_fail_fast())
+        backend = make_backend(
+            token,
+            proxy=proxy,
+            retry_decorator=_fail_fast(),
+            max_pages=MAX_PAGE_REQUESTS,
+        )
         result = await _await_worker(
             asyncio.create_task(_read(backend, operation, params)),
             request_deadline,
@@ -195,7 +220,9 @@ async def _profile(backend: LookupBackend, username: str) -> dict[str, Any]:
     return {
         "kind": "lookup_profile",
         "target_pk": _identity(pk),
-        "access": "private" if found.is_private or found.access == "private" else "public",
+        # Permissive only for the one value that means it: `followed`,
+        # `blocked` or anything new is reported as private, never as public.
+        "access": "public" if found.access == "public" and not found.is_private else "private",
         "fields": fields,
         "unknown_fields": unknown,
         "quota_remaining": _remaining(backend),
@@ -207,11 +234,19 @@ async def _activity(backend: LookupBackend, target_pk: str, window: int) -> dict
 
     The pk comes from `lookup.profile`, so nothing is resolved again: the fetch
     is the posts fetch and its pages, and no per-post request is ever made.
+    At most `MAX_PAGE_REQUESTS` pages are ever bought: a cursor that keeps
+    offering thin or empty pages stops there and the window is analysed as far
+    as it was actually paid for, which `analyzed` reports honestly.
     """
-    posts = [post async for post in backend.iter_user_posts(target_pk, limit=window)]
+    posts: list[Post] = []
+    try:
+        async for post in backend.iter_user_posts(target_pk, limit=window):
+            posts.append(post)
+    except PageBudgetExceeded:
+        pass
     try:
         geo = analytics.compute_geo_fingerprint(
-            posts, target=target_pk, limit=window, top=_TOP_PLACES
+            [_locatable(post) for post in posts], target=target_pk, limit=window, top=_TOP_PLACES
         )
         timeline = analytics.compute_timeline(posts, target=target_pk, limit=window)
         hashtags = analytics.extract_hashtags(posts, target=target_pk, limit=window, top=_TOP_TERMS)
@@ -222,8 +257,9 @@ async def _activity(backend: LookupBackend, target_pk: str, window: int) -> dict
         likes = analytics.aggregate_likes(posts, target=target_pk, limit=window, top=_TOP_POSTS)
     except (ValueError, OverflowError, OSError):
         # Only a payload no analysis can represent gets here (an unrepresentable
-        # timestamp, say). It is reported, never half-answered.
-        raise DesktopError("access_unconfirmed") from None
+        # timestamp, say). It is reported, never half-answered, and it is not
+        # retryable: the same request would return the same unreadable answer.
+        raise DesktopError("provider_response_invalid") from None
     return {
         "kind": "lookup_activity",
         "target_pk": target_pk,
@@ -259,10 +295,25 @@ async def _activity(backend: LookupBackend, target_pk: str, window: int) -> dict
     }
 
 
+def _locatable(post: Post) -> Post:
+    """A coordinate JSON cannot carry is not a geotag at all.
+
+    Dropping it only on the way out would leave `geotagged` counting a post
+    that `places`, `centroid` and `radius_km` had to omit — and one NaN
+    poisons the centroid and radius of the whole window. Stripping it here
+    keeps every number in the `geo` block about the same posts.
+    """
+    if post.location_lat is None and post.location_lng is None:
+        return post
+    if _coordinate(post.location_lat) is not None and _coordinate(post.location_lng) is not None:
+        return post
+    return replace(post, location_lat=None, location_lng=None)
+
+
 def _identity(pk: str) -> str:
     """The pk the app will hand back to `lookup.activity`, in its own form."""
     if not isinstance(pk, str) or _PK.fullmatch(pk) is None:
-        raise DesktopError("access_unconfirmed")
+        raise DesktopError("provider_response_invalid")
     return pk
 
 
@@ -270,13 +321,13 @@ def _text(value: Any, characters: int) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str):
-        raise DesktopError("access_unconfirmed")
+        raise DesktopError("provider_response_invalid")
     return value[:characters]
 
 
 def _count(value: Any) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
-        raise DesktopError("access_unconfirmed")
+        raise DesktopError("provider_response_invalid")
     number: int = value
     return min(max(number, 0), MAX_COUNT)
 

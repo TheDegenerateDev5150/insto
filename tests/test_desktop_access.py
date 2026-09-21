@@ -127,6 +127,23 @@ async def test_repeated_cancel_drains_close_once(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_page_ceiling_is_opt_in_and_leaves_every_other_caller_alone():
+    """The desktop lookups buy a small, fixed number of pages; nobody else changes."""
+    from insto.backends.hiker import DEFAULT_MAX_PAGES
+
+    capped = access.make_backend("candidate-secret", max_pages=6)
+    try:
+        assert capped._max_pages == 6
+    finally:
+        await capped.aclose()
+    default = access.make_backend("candidate-secret")
+    try:
+        assert default._max_pages == DEFAULT_MAX_PAGES
+    finally:
+        await default.aclose()
+
+
+@pytest.mark.asyncio
 async def test_sdk_transport_ignores_poisoned_environment(monkeypatch):
     from insto.backends.hiker import HikerBackend
 
