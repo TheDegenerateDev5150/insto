@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import time
 from pathlib import Path
@@ -13,10 +14,37 @@ from insto.exceptions import BackendError
 from insto.models import Profile
 from insto.service.history import (
     CLI_HISTORY_RETENTION_DAYS,
+    MEDIA_HASH_ALGO,
+    MEDIA_HASH_ALGO_FIELD,
     SNAPSHOT_MAX_PER_TARGET,
     SNAPSHOT_RETENTION_DAYS,
     HistoryStore,
     hash_url,
+    media_hashes_comparable,
+    media_hashes_stable,
+)
+from insto.service.watch import format_watch_diff
+
+# One real avatar URL observed from the HikerAPI backend, with the parts that
+# rotate between two fetches of the very same picture: the edge host, the signed
+# `oh`/`oe`/`_nc_ohc` parameters and the `stp` size variant. Those are what the
+# identity is evidenced to survive; an HD/non-HD flip that changed the file name
+# is an unverified residual risk worth one false change, not one per check.
+_AVATAR_PATH = "/v/t51.82787-19/550891366_18667771684001321_1383210656577177067_n.jpg"
+_AVATAR_A = (
+    "https://scontent-lax3-2.cdninstagram.com" + _AVATAR_PATH + "?stp=dst-jpg_e0_s150x150_tt6"
+    "&_nc_ht=scontent-lax3-2.cdninstagram.com&_nc_ohc=zQKhYsAesT4Q7kNvwFn_CpJ"
+    "&oh=00_Af08wL20KygJVgRxKHn3UV7yz-vUPQ1-jHemItgjVzXErA&oe=69F70B27"
+)
+_AVATAR_A_AGAIN = (
+    "https://instagram.fwaw2-1.fbcdn.net" + _AVATAR_PATH + "?stp=dst-jpg_e0_s1080x1080_tt6"
+    "&_nc_ht=instagram.fwaw2-1.fbcdn.net&_nc_ohc=OTHERohcTOKEN0000000000"
+    "&oh=00_AfZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ&oe=6A0001FF"
+)
+_AVATAR_B = (
+    "https://scontent-lax3-2.cdninstagram.com"
+    "/v/t51.82787-19/999999999_18667771684001321_1383210656577177067_n.jpg"
+    "?stp=dst-jpg_e0_s150x150_tt6&oh=00_Af08wL20KygJVgRxKHn3UV&oe=69F70B27"
 )
 
 
@@ -228,6 +256,134 @@ def test_url_hashing_helper() -> None:
     assert h1 == h2
     assert h1 != h3
     assert len(h1) == 64  # sha256 hex
+
+
+def test_hash_url_identifies_the_media_not_the_signed_url() -> None:
+    # Same picture, other edge host, other signed query, other size variant.
+    assert hash_url(_AVATAR_A) == hash_url(_AVATAR_A_AGAIN)
+    # A size variant that lives in the path instead of the query is the same
+    # picture too — the final segment is the identity.
+    assert hash_url(_AVATAR_A) == hash_url(
+        "https://scontent.cdninstagram.com/v/t51.2885-19/s150x150"
+        + _AVATAR_PATH[len("/v/t51.82787-19") :]
+    )
+    # A different upload is a different hash.
+    assert hash_url(_AVATAR_A) != hash_url(_AVATAR_B)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "not a url",
+        "https://",
+        "https://cdn.example",
+        "https://cdn.example/",
+        "ftp://cdn.example/a.jpg",
+        "data:image/png;base64,AAAA",
+        "https://[oops/a.jpg",  # urlsplit raises ValueError
+    ],
+)
+def test_hash_url_falls_back_to_the_whole_value_when_it_is_not_a_media_url(url: str) -> None:
+    import hashlib
+
+    digest = hash_url(url)
+    assert digest == hashlib.sha256(url.encode("utf-8")).hexdigest()
+    assert len(digest) == 64 and digest == digest.lower()
+
+
+def test_hash_url_is_always_a_lowercase_sha256_hex_digest() -> None:
+    for url in (_AVATAR_A, _AVATAR_B, "not a url", "https://cdn.example/Ünïcødé .jpg"):
+        digest = hash_url(url)
+        assert digest is not None
+        assert len(digest) == 64
+        assert all(character in "0123456789abcdef" for character in digest)
+
+
+def test_snapshot_from_profile_stamps_the_media_hash_algorithm(store: HistoryStore) -> None:
+    p = _make_profile(pk="42", avatar_url=_AVATAR_A)
+    snap = store.snapshot_from_profile(p, post_pks=[])
+    assert snap.profile_fields[MEDIA_HASH_ALGO_FIELD] == MEDIA_HASH_ALGO
+    assert media_hashes_stable(snap.profile_fields)
+    store.add_snapshot(snap)
+    stored = store.last_snapshot("42")
+    assert stored is not None
+    assert media_hashes_stable(stored.profile_fields)
+
+
+def test_media_hashes_need_the_current_algorithm_on_both_sides() -> None:
+    current = {MEDIA_HASH_ALGO_FIELD: MEDIA_HASH_ALGO}
+    legacy_shapes = (
+        {},
+        {MEDIA_HASH_ALGO_FIELD: MEDIA_HASH_ALGO - 1},
+        {MEDIA_HASH_ALGO_FIELD: None},
+    )
+    for legacy in legacy_shapes:
+        assert not media_hashes_stable(legacy)
+        # Both directions: an older writer's row may be the newer of a pair too
+        # (an old CLI sharing the same store writes after the upgrade).
+        assert not media_hashes_comparable(legacy, current)
+        assert not media_hashes_comparable(current, legacy)
+    assert media_hashes_comparable(current, current)
+    # `True == 1` must not pass for algorithm 1, nor a float or a digit string.
+    for bogus in (True, float(MEDIA_HASH_ALGO), str(MEDIA_HASH_ALGO)):
+        assert not media_hashes_stable({MEDIA_HASH_ALGO_FIELD: bogus})
+
+
+def _legacy_row(store: HistoryStore, *, captured_at: int, pk: str = "42") -> None:
+    """A row exactly as a pre-fix insto wrote it: whole-URL digests, no sentinel."""
+    store._conn.execute(
+        "INSERT INTO snapshots(target_pk, captured_at, profile_fields_json, "
+        "last_post_pks_json, avatar_url_hash, banner_url_hash) VALUES(?, ?, ?, '[]', ?, ?)",
+        (pk, captured_at, json.dumps({"username": "alice"}), "a" * 64, "b" * 64),
+    )
+
+
+def test_diff_ignores_media_hashes_of_a_snapshot_without_the_sentinel(
+    store: HistoryStore,
+) -> None:
+    _legacy_row(store, captured_at=int(time.time()) - 3600)
+    p = _make_profile(pk="42", avatar_url=_AVATAR_A, banner_url=_AVATAR_B)
+    changes = store.diff("42", p)["changes"]
+    assert "avatar" not in changes and "banner" not in changes
+
+    # Storing a new-algorithm row does not retroactively make the old one
+    # comparable, and a *newer* legacy row (an old CLI writing after the
+    # upgrade) is not comparable either: `diff` reads the most recent snapshot.
+    store.add_snapshot(store.snapshot_from_profile(p, post_pks=[]))
+    _legacy_row(store, captured_at=int(time.time()) + 60)
+    changes = store.diff("42", p)["changes"]
+    assert "avatar" not in changes and "banner" not in changes
+
+
+def test_diff_reports_a_real_swap_but_not_a_re_signed_url(store: HistoryStore) -> None:
+    p = _make_profile(pk="42", avatar_url=_AVATAR_A)
+    store.add_snapshot(store.snapshot_from_profile(p, post_pks=[]))
+
+    # The same picture fetched again through another edge with a fresh signature.
+    p.avatar_url = _AVATAR_A_AGAIN
+    assert store.diff("42", p)["changes"] == {}
+
+    p.avatar_url = _AVATAR_B
+    assert store.diff("42", p)["changes"]["avatar"] == {
+        "old": hash_url(_AVATAR_A),
+        "new": hash_url(_AVATAR_B),
+    }
+
+
+def test_the_sentinel_never_surfaces_in_a_diff_or_its_json_export(store: HistoryStore) -> None:
+    p = _make_profile(pk="42", avatar_url=_AVATAR_A)
+    store.add_snapshot(store.snapshot_from_profile(p, post_pks=[]))
+    p.full_name = "Renamed"
+    p.avatar_url = _AVATAR_B
+    diff = store.diff("42", p)
+    assert set(diff["changes"]) == {"full_name", "avatar"}
+    # `/diff` prints `format_watch_diff(diff)` and `--json` exports this dict
+    # verbatim, so absence here is absence at both surfaces.
+    assert MEDIA_HASH_ALGO_FIELD not in json.dumps(diff)
+    assert MEDIA_HASH_ALGO_FIELD not in format_watch_diff("alice", diff)
+    # `/history` and the welcome screen read cli_history, never profile fields.
+    store.record_command("diff", "alice")
+    assert MEDIA_HASH_ALGO_FIELD not in json.dumps(store.recent_commands())
 
 
 def test_snapshot_from_profile_hashes_urls(store: HistoryStore) -> None:

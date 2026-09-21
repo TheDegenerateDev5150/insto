@@ -70,7 +70,7 @@ Commands never `except BackendError` themselves. The dispatcher catches everythi
 All persistent state lives in one DB at `~/.insto/store.db` (mode `0600`):
 
 ```text
-_meta             schema_version
+_meta             schema_version, first_check_attempted:<user>
 cli_history       cmd, target, ts            (90-day retention, indexed on ts)
 watches           user, registration_id, interval_seconds, last_ok, last_error,
                   consecutive_errors, status
@@ -81,7 +81,22 @@ snapshots         target_pk, captured_at, profile_fields_json, last_post_pks_jso
 - One `sqlite3.Connection` per session, owned by the facade.
 - `asyncio.to_thread` wraps every sync call from async contexts so the event loop never blocks.
 - `migrate_to_latest()` runs on startup under `BEGIN IMMEDIATE` so two `insto` processes don't race a schema bump.
-- URLs (avatar / banner) are SHA256-hashed before write — diffing checks hash inequality, not the URL.
+- Avatar / banner URLs are SHA256-hashed before write — diffing checks hash inequality, never the URL.
+  The digest covers the media identity (the last path segment of the CDN URL), not the whole URL: the
+  edge host and the signed `oh` / `oe` / `_nc_ohc` / `stp` parameters are re-issued on every fetch, so a
+  whole-URL digest changed on every check. What the evidence covers is that rotation; whether an
+  HD/non-HD fallback can change the file name is unverified, and would cost one false change per flip.
+- Rows written before that change hold whole-URL digests and cannot be recomputed (the URLs are not
+  stored), so each snapshot records which algorithm hashed it: `snapshot_from_profile` writes
+  `_media_hash_algo` into `profile_fields_json`. It is a per-row sentinel, not a `_meta` moment and not
+  a column, so `schema_version` stays 2 and an older insto sharing the same `~/.insto/store.db` —
+  the CLI on PyPI keeps writing whole-URL digests after the desktop app upgrades — cannot be mistaken
+  for a new-algorithm writer. Every comparison — `/diff`, the `/watch` notification and the webhook,
+  and the desktop `snapshots.compare` / `changes.list` — reports an avatar or banner difference only
+  when *both* rows carry the current sentinel; otherwise the pair is silently not comparable and
+  appears neither as a change nor as an unknown field. `snapshots.read` is not gated: it reports the
+  stored digest as it is. The sentinel never leaves the store: every reader iterates the tracked
+  profile fields, and the read-only record validator skips unknown keys rather than rejecting them.
 
 ## Output / export
 

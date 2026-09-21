@@ -290,7 +290,11 @@ class Snapshot:
     `profile_fields` is a flat dict of the watched scalar fields on `Profile`
     at capture time (full_name, biography, follower_count, etc.). Avatar and
     banner URLs are stored as sha256 hashes only — diffing checks hash
-    inequality, not URL identity.
+    inequality, not URL identity. The digest covers the media identity (the
+    last path segment), not the signed URL, so the same picture re-fetched
+    through another CDN edge hashes the same. Which algorithm hashed a row is
+    recorded in `profile_fields` itself; see `service.history.hash_url` and
+    `media_hashes_stable`.
     """
 
     target_pk: str

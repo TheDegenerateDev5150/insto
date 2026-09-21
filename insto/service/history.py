@@ -46,9 +46,10 @@ import re
 import sqlite3
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, TypeVar
+from urllib.parse import urlsplit
 
 from insto.exceptions import BackendError
 from insto.models import Profile, Snapshot, WatchRegistration, WatchSpec, WatchStatus
@@ -109,6 +110,27 @@ SNAPSHOT_MAX_PER_TARGET = 100
 # `schema_version` where the pinned desktop protocol expects it.
 _FIRST_CHECK_KEY = "first_check_attempted:"
 
+# Which algorithm produced a row's `avatar_url_hash` / `banner_url_hash`.
+# 1 (never written: it is the absence of the key) is the sha256 of the whole
+# signed CDN URL; 2 is the sha256 of the media identity (see `hash_url`). The
+# value is a per-row sentinel kept inside the existing `profile_fields_json`
+# payload, so it needs no column, no `_meta` key and no migration, and
+# `schema_version` stays where the pinned desktop protocol expects it.
+#
+# Per row rather than one moment per store on purpose: this very version is on
+# PyPI as 0.7.22, and an older CLI pointed at the same `~/.insto/store.db` keeps
+# writing whole-URL digests after the upgrade. A timestamp would call those rows
+# comparable; a sentinel the old writer does not know about cannot.
+#
+# It never reaches a reader: every consumer of `profile_fields` iterates
+# `_PROFILE_TRACKED_FIELDS`, and the read-only record validator skips (rather
+# than rejects) keys outside that tuple — in this version and in 0.7.22
+# — so an older insto reading a newer row ignores it.
+MEDIA_HASH_ALGO_FIELD = "_media_hash_algo"
+MEDIA_HASH_ALGO = 2
+
+_MEDIA_URL_SCHEMES = frozenset({"http", "https"})
+
 _PROFILE_TRACKED_FIELDS: tuple[str, ...] = (
     "username",
     "full_name",
@@ -136,11 +158,86 @@ class _Unchanged:
 UNCHANGED = _Unchanged()
 
 
+def _media_identity(url: str) -> str:
+    """Return the part of `url` that identifies the media itself.
+
+    Instagram serves one picture from a rotating edge host
+    (`scontent-lax3-2.cdninstagram.com`, `instagram.f…fbcdn.net`) with signed,
+    per-response query parameters (`oh`, `oe`, `_nc_ohc`, `_nc_ht`, `_nc_gid`,
+    `stp`, …). A real avatar URL looks like
+
+        https://scontent-lax3-2.cdninstagram.com
+            /v/t51.82787-19/550891366_18667771684001321_1383210656577177067_n.jpg
+            ?stp=dst-jpg_e0_s150x150_tt6&…&oh=00_Af08…&oe=69F70B27
+
+    where only the last path segment names the image: the size variant lives in
+    the query (`s150x150` inside `stp`) or, in older shapes, in an extra path
+    segment (`/s150x150/`), and the bucket segment (`t51.2885-19` →
+    `t51.82787-19`) is migrated server-side. The final segment survives all of
+    that, so it is the identity.
+
+    What this does *not* claim: both mappers fall back from `profile_pic_url_hd`
+    to `profile_pic_url`, and there is no captured pair of those two fields to
+    show whether they share a file name. If a flip between them ever changes the
+    final segment it costs one false `avatar` change per flip, not one per check
+    — the repository's own fixtures (`tests/fixtures/hiker/profile_public.json`)
+    model the two as `avatar.jpg` and `avatar_hd.jpg`, i.e. as differing. Do not
+    narrow this to an upload-id prefix without a real pair to test against.
+
+    Anything that is not an http(s) URL with a non-empty path is returned whole,
+    which keeps the pre-existing behaviour for unparsable input.
+    """
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return url
+    if parts.scheme.lower() not in _MEDIA_URL_SCHEMES:
+        return url
+    segments = [segment for segment in parts.path.split("/") if segment]
+    if not segments:
+        return url
+    return segments[-1]
+
+
 def hash_url(url: str | None) -> str | None:
-    """Return sha256 hex digest of a URL (or None if url is None/empty)."""
+    """Return a stable sha256 hex digest for a media URL (None if None/empty).
+
+    The digest covers `_media_identity(url)`, not the URL, so the same picture
+    fetched an hour later through another edge host with fresh signed query
+    parameters hashes the same. The name is kept because it is the module's
+    public helper and `avatar_url_hash` / `banner_url_hash` still hold a
+    64-character lowercase sha256 hex digest, the shape the read-only record
+    validator enforces.
+    """
     if not url:
         return None
-    return hashlib.sha256(url.encode("utf-8")).hexdigest()
+    return hashlib.sha256(_media_identity(url).encode("utf-8")).hexdigest()
+
+
+def media_hashes_stable(profile_fields: Mapping[str, Any]) -> bool:
+    """True when a snapshot's avatar/banner hashes use the current identity.
+
+    A row without the sentinel was written by an insto that hashed the whole
+    signed CDN URL. Those digests cannot be recomputed (the URLs are not
+    stored), so a difference against them says nothing about the picture.
+    `type(value) is int` also rejects a `True` that would otherwise compare
+    equal to 1.
+    """
+    value = profile_fields.get(MEDIA_HASH_ALGO_FIELD)
+    return type(value) is int and value == MEDIA_HASH_ALGO
+
+
+def media_hashes_comparable(
+    older_fields: Mapping[str, Any],
+    newer_fields: Mapping[str, Any],
+) -> bool:
+    """True when two snapshots may have their avatar/banner hashes compared.
+
+    Both sides must carry the current algorithm — including the newer one,
+    because an older insto sharing the same store keeps writing whole-URL
+    digests after the upgrade, and such a row can be the newer of a pair.
+    """
+    return media_hashes_stable(older_fields) and media_hashes_stable(newer_fields)
 
 
 def _now_ts() -> int:
@@ -427,6 +524,10 @@ class HistoryStore:
         Returns a dict with `first_seen` (bool), `changes` (field -> {old,new}),
         and `previous_usernames` (every distinct historical username for
         `target_pk` that does not equal `current.username`, oldest first).
+
+        `avatar` / `banner` are reported only when the stored snapshot carries
+        the current media-hash algorithm (see `media_hashes_stable`); otherwise
+        the pair is silently not comparable rather than a change on every check.
         """
         last = self.last_snapshot(target_pk)
         prior_names = [n for n in self._all_snapshot_usernames(target_pk) if n != current.username]
@@ -442,12 +543,18 @@ class HistoryStore:
             new = getattr(current, f)
             if old != new:
                 changes[f] = {"old": old, "new": new}
-        cur_avatar = current.avatar_url_hash or hash_url(current.avatar_url)
-        cur_banner = current.banner_url_hash or hash_url(current.banner_url)
-        if last.avatar_url_hash != cur_avatar:
-            changes["avatar"] = {"old": last.avatar_url_hash, "new": cur_avatar}
-        if last.banner_url_hash != cur_banner:
-            changes["banner"] = {"old": last.banner_url_hash, "new": cur_banner}
+        # `current` is hashed here and now, so the live side always carries the
+        # current algorithm; only the stored row can be an older writer's. When
+        # it is, the pair is not comparable and neither key is reported — a
+        # whole-URL digest differs from a media-identity digest for reasons that
+        # have nothing to do with the picture.
+        if media_hashes_stable(last.profile_fields):
+            cur_avatar = current.avatar_url_hash or hash_url(current.avatar_url)
+            cur_banner = current.banner_url_hash or hash_url(current.banner_url)
+            if last.avatar_url_hash != cur_avatar:
+                changes["avatar"] = {"old": last.avatar_url_hash, "new": cur_avatar}
+            if last.banner_url_hash != cur_banner:
+                changes["banner"] = {"old": last.banner_url_hash, "new": cur_banner}
         return {
             "first_seen": False,
             "changes": changes,
@@ -460,6 +567,9 @@ class HistoryStore:
         for f in _PROFILE_TRACKED_FIELDS:
             value = getattr(profile, f)
             fields[f] = value
+        # Which algorithm hashed the two URLs below. Not a tracked field, so no
+        # reader ever surfaces it; see `MEDIA_HASH_ALGO_FIELD`.
+        fields[MEDIA_HASH_ALGO_FIELD] = MEDIA_HASH_ALGO
         return Snapshot(
             target_pk=profile.pk,
             captured_at=_now_ts(),

@@ -9,7 +9,24 @@ from insto.desktop.errors import DesktopError
 from insto.desktop.history import run
 from insto.desktop.history_params import validate_params
 from insto.desktop.protocol import MAX_OUTPUT_BYTES, encode
-from insto.service.history import _PROFILE_TRACKED_FIELDS
+from insto.service.history import (
+    _PROFILE_TRACKED_FIELDS,
+    MEDIA_HASH_ALGO,
+    MEDIA_HASH_ALGO_FIELD,
+)
+
+
+def hashes(profile, identifier, avatar=None, banner=None):
+    with closing(sqlite3.connect(profile.home / "store.db")) as db, db:
+        db.execute(
+            "UPDATE snapshots SET avatar_url_hash=?, banner_url_hash=? WHERE id=?",
+            (avatar, banner, identifier),
+        )
+
+
+def stable(**updates):
+    """Tracked fields plus the per-row sentinel a current writer stamps."""
+    return fields(**{**updates, MEDIA_HASH_ALGO_FIELD: MEDIA_HASH_ALGO})
 
 
 def fields(**updates):
@@ -89,7 +106,9 @@ def test_compare_same_pk_retention_and_chronological_order(monitoring_profile):
 def test_read_reports_the_same_fields_and_typing_as_compare(monitoring_profile):
     p = monitoring_profile
     avatar, banner = "a" * 64, "b" * 64
-    payload = fields(
+    # Both rows carry the media-hash sentinel, so the hashes are comparable
+    # and `read` and `compare` report them identically.
+    payload = stable(
         full_name="Alice",
         external_url=None,
         is_verified=True,
@@ -100,11 +119,7 @@ def test_read_reports_the_same_fields_and_typing_as_compare(monitoring_profile):
         media_count=5,
     )
     identifier = insert(p, stamp=2, payload=payload)
-    with closing(sqlite3.connect(p.home / "store.db")) as db, db:
-        db.execute(
-            "UPDATE snapshots SET avatar_url_hash=?, banner_url_hash=? WHERE id=?",
-            (avatar, banner, identifier),
-        )
+    hashes(p, identifier, avatar, banner)
     result = request(p, "snapshots.read", {"target_pk": "7", "snapshot_id": identifier})
     assert result == {
         "kind": "snapshot_fields",
@@ -130,7 +145,14 @@ def test_read_reports_the_same_fields_and_typing_as_compare(monitoring_profile):
     }
     # The same names, the same values and the same hash treatment `compare` uses,
     # so the app can reuse one formatter for both.
-    empty = insert(p, stamp=1, payload=dict.fromkeys(_PROFILE_TRACKED_FIELDS, None))
+    empty = insert(
+        p,
+        stamp=1,
+        payload={
+            **dict.fromkeys(_PROFILE_TRACKED_FIELDS, None),
+            MEDIA_HASH_ALGO_FIELD: MEDIA_HASH_ALGO,
+        },
+    )
     difference = request(
         p, "snapshots.compare", {"target_pk": "7", "older_id": empty, "newer_id": identifier}
     )
@@ -710,3 +732,118 @@ def test_sqlite_busy_is_bounded_and_explicit(monitoring_profile):
     finally:
         writer.rollback()
         writer.close()
+
+
+def test_media_hashes_are_compared_only_when_both_rows_carry_the_algorithm(monitoring_profile):
+    p = monitoring_profile
+    old = insert(p, stamp=5, payload=stable())
+    new = insert(p, stamp=9, payload=stable())
+    hashes(p, old, avatar="a" * 64, banner="c" * 64)
+    hashes(p, new, avatar="b" * 64, banner="d" * 64)
+    params = {"target_pk": "7", "older_id": old, "newer_id": new}
+
+    # Both rows carry it: a real swap is reported, through both operations.
+    assert request(p, "snapshots.compare", params)["changes"] == [
+        {"field": "avatar", "old": "a" * 64, "new": "b" * 64},
+        {"field": "banner", "old": "c" * 64, "new": "d" * 64},
+    ]
+    feed = request(p, "changes.list", {"target_pk": "7"})
+    assert [item["kind"] for item in feed["items"]] == ["comparison", "baseline"]
+    assert feed["items"][0]["unknown_fields"] == []
+    assert MEDIA_HASH_ALGO_FIELD not in json.dumps(feed)
+
+
+def _legacy_pair(profile, legacy):
+    """A pair where `legacy` says which side an older insto wrote (no sentinel)."""
+    older_payload = fields() if legacy in ("older", "both") else stable()
+    newer_payload = fields() if legacy in ("newer", "both") else stable()
+    old = insert(profile, stamp=5, payload=older_payload)
+    new = insert(profile, stamp=9, payload=newer_payload)
+    hashes(profile, old, avatar="a" * 64, banner="c" * 64)
+    hashes(profile, new, avatar="b" * 64, banner="d" * 64)
+    return old, new
+
+
+@pytest.mark.parametrize("legacy", ["older", "newer", "both"])
+def test_compare_never_reports_a_row_without_the_algorithm_in_either_position(
+    monitoring_profile, legacy
+):
+    """An old insto sharing the store writes whole-URL digests before *and* after."""
+    p = monitoring_profile
+    old, new = _legacy_pair(p, legacy)
+    result = request(p, "snapshots.compare", {"target_pk": "7", "older_id": old, "newer_id": new})
+    assert result["changes"] == []
+    assert result["unknown_fields"] == []
+    # `snapshots.read` is not gated: it reports the stored digest as it is.
+    stored = request(p, "snapshots.read", {"target_pk": "7", "snapshot_id": old})
+    assert stored["fields"]["avatar"] == "a" * 64
+    assert stored["fields"]["banner"] == "c" * 64
+
+
+@pytest.mark.parametrize("legacy", ["older", "newer", "both"])
+def test_the_feed_yields_no_item_for_a_pair_without_the_algorithm(monitoring_profile, legacy):
+    p = monitoring_profile
+    old, _ = _legacy_pair(p, legacy)
+    # Nothing else differs, so the feed shows only the baseline - no item at all,
+    # exactly as for an unchanged pair.
+    assert request(p, "changes.list", {"target_pk": "7"})["items"] == [
+        {"kind": "baseline", "snapshot": {"id": old, "target_pk": "7", "captured_at": 5}}
+    ]
+
+
+def test_the_algorithm_sentinel_never_reaches_a_desktop_result(monitoring_profile):
+    p = monitoring_profile
+    old = insert(p, stamp=5, payload=stable(username="alice"))
+    new = insert(p, stamp=9, payload=stable(username="renamed"))
+    hashes(p, old, avatar="a" * 64)
+    hashes(p, new, avatar="b" * 64)
+    surfaces = [
+        request(p, "snapshots.read", {"target_pk": "7", "snapshot_id": new}),
+        request(p, "snapshots.compare", {"target_pk": "7", "older_id": old, "newer_id": new}),
+        request(p, "changes.list", {"target_pk": "7"}),
+        request(p, "changes.list", {}),
+        request(p, "snapshots.list", {"target_pk": "7"}),
+        request(p, "snapshots.targets", {"username": "alice"}),
+    ]
+    for result in surfaces:
+        assert MEDIA_HASH_ALGO_FIELD not in json.dumps(result)
+    read = surfaces[0]
+    assert MEDIA_HASH_ALGO_FIELD not in read["fields"]
+    assert MEDIA_HASH_ALGO_FIELD not in read["unknown_fields"]
+    assert set(read["fields"]) == {*_PROFILE_TRACKED_FIELDS, "avatar", "banner"}
+    compared = surfaces[1]
+    assert [change["field"] for change in compared["changes"]] == ["username", "avatar"]
+    assert compared["unknown_fields"] == []
+
+
+def test_an_unknown_extra_field_is_ignored_rather_than_rejected(monitoring_profile):
+    """The property that lets an older insto read a newer row: extras are skipped."""
+    p = monitoring_profile
+    payload = stable(username="alice")
+    payload["_some_future_key"] = 7
+    identifier = insert(p, stamp=1, payload=payload)
+    result = request(p, "snapshots.read", {"target_pk": "7", "snapshot_id": identifier})
+    assert result["kind"] == "snapshot_fields"
+    assert "_some_future_key" not in json.dumps(result)
+
+
+def test_comparing_never_writes_into_the_store(monitoring_profile, monkeypatch):
+    p = monitoring_profile
+    old = insert(p, stamp=5, payload=stable())
+    new = insert(p, stamp=9, payload=stable())
+    hashes(p, old, avatar="a" * 64)
+    hashes(p, new, avatar="b" * 64)
+    from insto.desktop import database
+    from insto.desktop import history as desktop_history
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("the saved-history reader must never open the store for writing")
+
+    monkeypatch.setattr(database, "write_database", forbidden)
+    monkeypatch.setattr(desktop_history, "write_database", forbidden, raising=False)
+    with closing(sqlite3.connect(p.home / "store.db")) as db:
+        before = db.execute("SELECT COUNT(*) FROM _meta").fetchone()[0]
+    request(p, "snapshots.compare", {"target_pk": "7", "older_id": old, "newer_id": new})
+    request(p, "changes.list", {"target_pk": "7"})
+    with closing(sqlite3.connect(p.home / "store.db")) as db:
+        assert db.execute("SELECT COUNT(*) FROM _meta").fetchone()[0] == before

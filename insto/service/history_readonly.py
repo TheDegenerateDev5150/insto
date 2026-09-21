@@ -10,7 +10,7 @@ from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from typing import Any
 
-from insto.service.history import _PROFILE_TRACKED_FIELDS
+from insto.service.history import _PROFILE_TRACKED_FIELDS, media_hashes_comparable
 
 Check = Callable[[], None]
 RAW_LIMIT = 65536
@@ -185,6 +185,18 @@ def snapshot(row: sqlite3.Row, check: Check) -> SavedSnapshot:
 
 
 def comparison(old: SavedSnapshot, new: SavedSnapshot, check: Check) -> dict[str, Any]:
+    """Compare two saved snapshots; the media hashes are gated per row.
+
+    A row whose `profile_fields` carries no current media-hash sentinel was
+    written by an insto that hashed the whole signed CDN URL, and such a
+    digest cannot be told apart from a real picture swap, so a pair with one
+    on either side is left out of `changes` entirely. It is not listed in
+    `unknown_fields` either: that list means "this snapshot holds no value for
+    the field", while both rows do hold a digest here, and an entry there
+    would turn every such pair into an `incomplete` item in `changes.list`
+    — the very per-check noise this gate removes. The sentinel itself is
+    never reported: this function only ever iterates `_PROFILE_TRACKED_FIELDS`.
+    """
     check()
     changes: list[dict[str, Any]] = []
     unknown: list[str] = []
@@ -194,10 +206,11 @@ def comparison(old: SavedSnapshot, new: SavedSnapshot, check: Check) -> dict[str
             unknown.append(field)
         elif old.fields[field] != new.fields[field]:
             changes.append({"field": field, "old": old.fields[field], "new": new.fields[field]})
-    for field in ("avatar", "banner"):
-        before, after = getattr(old, field), getattr(new, field)
-        if before != after:
-            changes.append({"field": field, "old": before, "new": after})
+    if media_hashes_comparable(old.fields, new.fields):
+        for field in ("avatar", "banner"):
+            before, after = getattr(old, field), getattr(new, field)
+            if before != after:
+                changes.append({"field": field, "old": before, "new": after})
     check()
     return {
         "kind": "comparison",

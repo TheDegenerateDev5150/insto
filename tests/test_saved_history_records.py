@@ -3,13 +3,18 @@ import sqlite3
 
 import pytest
 
-from insto.service.history import _PROFILE_TRACKED_FIELDS
+from insto.service.history import (
+    _PROFILE_TRACKED_FIELDS,
+    MEDIA_HASH_ALGO,
+    MEDIA_HASH_ALGO_FIELD,
+)
 from insto.service.history_readonly import (
     PROJECTION,
     HistoryReadError,
     comparison,
     metadata,
     snapshot,
+    snapshot_fields,
 )
 
 
@@ -25,7 +30,16 @@ def connection():
     db.close()
 
 
-def row(db, payload, posts="[]", *, identifier=1, stamp=1, pk="7", avatar=None):
+def stamped(payload):
+    """`payload` with the sentinel a current snapshot writer puts in it."""
+    value = json.loads(payload)
+    value[MEDIA_HASH_ALGO_FIELD] = MEDIA_HASH_ALGO
+    return json.dumps(value)
+
+
+def row(db, payload, posts="[]", *, identifier=1, stamp=1, pk="7", avatar=None, stable=False):
+    if stable:
+        payload = stamped(payload)
     db.execute(
         "INSERT INTO snapshots VALUES (?, ?, ?, ?, ?, ?, NULL)",
         (identifier, pk, stamp, payload, posts, avatar),
@@ -128,16 +142,48 @@ def test_absent_old_field_is_unknown_but_null_is_known(connection):
 def test_identity_precision_ties_and_hash_semantics(connection):
     fields = json.dumps(dict.fromkeys(_PROFILE_TRACKED_FIELDS, None))
     older = snapshot(
-        row(connection, fields, identifier=9007199254740993, stamp=3, avatar="a" * 64), lambda: None
+        row(
+            connection,
+            fields,
+            identifier=9007199254740993,
+            stamp=3,
+            avatar="a" * 64,
+            stable=True,
+        ),
+        lambda: None,
     )
     newer = snapshot(
-        row(connection, fields, identifier=9007199254740994, stamp=3, avatar="b" * 64), lambda: None
+        row(
+            connection,
+            fields,
+            identifier=9007199254740994,
+            stamp=3,
+            avatar="b" * 64,
+            stable=True,
+        ),
+        lambda: None,
     )
     result = comparison(older, newer, lambda: None)
     assert result["older"]["id"] == "9007199254740993"
     assert result["newer"]["captured_at"] == 3
     assert result["changes"] == [{"field": "avatar", "old": "a" * 64, "new": "b" * 64}]
     assert result["unknown_fields"] == []
+    # The same pair is not comparable when either side lacks the algorithm
+    # sentinel: those digests were produced by a different algorithm, so
+    # neither `changes` nor `unknown_fields` may claim anything about them.
+    legacy_old = snapshot(
+        row(connection, fields, identifier=11, stamp=3, avatar="a" * 64), lambda: None
+    )
+    legacy_new = snapshot(
+        row(connection, fields, identifier=12, stamp=3, avatar="b" * 64), lambda: None
+    )
+    for pair in ((legacy_old, newer), (older, legacy_new), (legacy_old, legacy_new)):
+        blind = comparison(*pair, lambda: None)
+        assert blind["changes"] == []
+        assert blind["unknown_fields"] == []
+    # And the sentinel is never a reported field on either path.
+    assert MEDIA_HASH_ALGO_FIELD not in json.dumps(result)
+    assert MEDIA_HASH_ALGO_FIELD not in json.dumps(snapshot_fields(older, lambda: None))
     assert (
         metadata(
             connection.execute("SELECT " + PROJECTION + " FROM snapshots LIMIT 1").fetchone()
