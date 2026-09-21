@@ -111,3 +111,18 @@ class Banned(BackendError):
     def __init__(self, detail: str = "backend account banned") -> None:
         super().__init__(detail)
         self.detail = detail
+
+
+class PageBudgetExceeded(BackendError):
+    """A cursor kept offering pages after the caller's page budget was spent.
+
+    Its message is the one `iter_*` has always raised for a non-terminating
+    cursor, so nothing a user reads changes; the type lets a caller that chose
+    a deliberately small budget (the desktop lookups) tell its own ceiling from
+    a backend failure and keep what it already paid for.
+    """
+
+    def __init__(self, endpoint: str, pages: int) -> None:
+        super().__init__(f"{endpoint}: cursor did not terminate after {pages} pages")
+        self.endpoint = endpoint
+        self.pages = pages

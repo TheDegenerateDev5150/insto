@@ -46,6 +46,7 @@ from insto.exceptions import (
     AuthInvalid,
     BackendError,
     Banned,
+    PageBudgetExceeded,
     PostNotFound,
     ProfileNotFound,
     QuotaExhausted,
@@ -460,9 +461,7 @@ class HikerBackend(OSINTBackend):
         yielded = 0
         while True:
             if pages >= self._max_pages:
-                raise BackendError(
-                    f"{endpoint}: cursor did not terminate after {self._max_pages} pages"
-                )
+                raise PageBudgetExceeded(endpoint, self._max_pages)
             payload = await self._call(partial(fetch, cursor))
             pages += 1
             items, next_cursor = _extract_chunk(payload)
@@ -688,9 +687,7 @@ class HikerBackend(OSINTBackend):
         endpoint = "hashtag_medias_recent_v2"
         while True:
             if pages >= self._max_pages:
-                raise BackendError(
-                    f"{endpoint}: cursor did not terminate after {self._max_pages} pages"
-                )
+                raise PageBudgetExceeded(endpoint, self._max_pages)
 
             async def fetch(c: str | None = cursor) -> Any:
                 return await self._client.hashtag_medias_recent_v2(name=tag, page_id=c)
@@ -739,9 +736,7 @@ class HikerBackend(OSINTBackend):
         endpoint = "fbsearch_accounts_v2"
         while True:
             if pages >= self._max_pages:
-                raise BackendError(
-                    f"{endpoint}: cursor did not terminate after {self._max_pages} pages"
-                )
+                raise PageBudgetExceeded(endpoint, self._max_pages)
 
             async def fetch(c: str | None = cursor) -> Any:
                 return await self._client.fbsearch_accounts_v2(query=query, page_token=c)
@@ -791,9 +786,7 @@ class HikerBackend(OSINTBackend):
         endpoint = "track_by_id_v2"
         while True:
             if pages >= self._max_pages:
-                raise BackendError(
-                    f"{endpoint}: cursor did not terminate after {self._max_pages} pages"
-                )
+                raise PageBudgetExceeded(endpoint, self._max_pages)
 
             async def fetch(c: str | None = cursor) -> Any:
                 return await self._client.track_by_id_v2(track_id=track_id, page_id=c)
@@ -876,9 +869,7 @@ class HikerBackend(OSINTBackend):
         endpoint = "user_reposts_gql"
         while True:
             if pages >= self._max_pages:
-                raise BackendError(
-                    f"{endpoint}: cursor did not terminate after {self._max_pages} pages"
-                )
+                raise PageBudgetExceeded(endpoint, self._max_pages)
 
             async def fetch(c: str | None = cursor) -> Any:
                 return await self._client.user_reposts_gql(

@@ -55,6 +55,7 @@ def with_retry(
     base_delay: float = DEFAULT_BASE_DELAY,
     max_delay: float = DEFAULT_MAX_DELAY,
     max_rate_limit_delay: float = DEFAULT_MAX_RATE_LIMIT_DELAY,
+    retry_rate_limited: bool = True,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     rng: random.Random | None = None,
 ) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
@@ -66,6 +67,11 @@ def with_retry(
         Total number of attempts (including the first). Must be >= 1.
     base_delay, max_delay:
         Bounds for the exponential backoff used on ``Transient``.
+    retry_rate_limited:
+        When False, ``RateLimited`` is re-raised from the first attempt and is
+        never slept on. Callers with a short fixed budget (the desktop network
+        reads) fail fast rather than holding a request open for a provider
+        cooldown they cannot outlive.
     sleep:
         Coroutine used to wait between attempts; defaults to ``asyncio.sleep``.
         Tests may inject a recorder to avoid wall-clock waits.
@@ -87,7 +93,7 @@ def with_retry(
                 try:
                     return await func(*args, **kwargs)
                 except RateLimited as exc:
-                    if attempt >= max_attempts:
+                    if not retry_rate_limited or attempt >= max_attempts:
                         raise
                     base = min(max(0.0, exc.retry_after), max_rate_limit_delay)
                     delay = base + jitter_rng.uniform(0.0, 0.25)

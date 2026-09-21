@@ -8,6 +8,7 @@ from insto.exceptions import (
     AuthInvalid,
     BackendError,
     Banned,
+    PageBudgetExceeded,
     PostNotFound,
     PostPrivate,
     ProfileBlocked,
@@ -35,6 +36,7 @@ def test_all_inherit_backend_error() -> None:
         SchemaDrift,
         Transient,
         Banned,
+        PageBudgetExceeded,
     ):
         assert issubclass(cls, BackendError)
 

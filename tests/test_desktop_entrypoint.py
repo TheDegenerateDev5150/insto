@@ -35,6 +35,8 @@ EXACT_CAPABILITIES = [
     "service.uninstall",
     "home.inspect",
     "home.select",
+    "lookup.profile",
+    "lookup.activity",
 ]
 
 

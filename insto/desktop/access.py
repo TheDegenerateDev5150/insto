@@ -4,22 +4,31 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from typing import Any, Protocol, TypeVar
+from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 from insto._redact import register_secret
 from insto.desktop.errors import DesktopError
 from insto.exceptions import AuthInvalid, QuotaExhausted, RateLimited, Transient
 from insto.models import Quota
 
+if TYPE_CHECKING:
+    from insto.backends.hiker import HikerBackend
+
 VALIDATION_SECONDS = 30.0
 _PENDING_WORKERS: set[asyncio.Task[Any]] = set()
 _T = TypeVar("_T")
+RetryDecorator = Callable[[Callable[..., Awaitable[Any]]], Callable[..., Awaitable[Any]]]
 
 
-class AccessBackend(Protocol):
-    async def validate_access(self) -> Quota: ...
+class ClosableBackend(Protocol):
+    """Every desktop provider client is closed inside its own budget."""
 
     async def aclose(self) -> None: ...
+
+
+class AccessBackend(ClosableBackend, Protocol):
+    async def validate_access(self) -> Quota: ...
 
 
 def validate_token(token: str) -> None:
@@ -31,20 +40,37 @@ def validate_token(token: str) -> None:
         raise DesktopError("invalid_params")
 
 
-def make_backend(token: str) -> AccessBackend:
+def make_backend(
+    token: str,
+    *,
+    proxy: str | None = None,
+    retry_decorator: RetryDecorator | None = None,
+    max_pages: int | None = None,
+) -> HikerBackend:
     """Adapt the pinned SDK constructor without mutating process environment.
 
     SDK BaseAsyncClient currently reads proxy/CA settings and HIKERAPI_HOST.
     Use its BaseClient initializer with an explicit packaged host, then supply
     the same HTTP transport with environment lookup disabled. This deliberately
     narrow adapter is covered by an actual SDK construction regression.
+
+    `proxy` is the profile's own configured proxy (an adopted CLI home may
+    carry one); it is validated by the backend's own rule before the SDK is
+    built. `retry_decorator` replaces the default five-attempt ladder and
+    `max_pages` the default page ceiling, for callers whose budget cannot
+    absorb either; both keep the backend's own defaults when omitted, so no
+    other caller changes. The returned object is the full `HikerBackend`;
+    `AccessBackend` is the part credential validation uses.
     """
     import hikerapi
     import httpx
     from hikerapi.__version__ import __host__
     from hikerapi.base import BaseClient
 
-    from insto.backends.hiker import HikerBackend
+    from insto.backends.hiker import HikerBackend, _validate_proxy_url
+
+    if proxy is not None:
+        _validate_proxy_url(proxy)
 
     class DesktopClient(hikerapi.AsyncClient):  # type: ignore[misc]
         def __init__(self) -> None:
@@ -55,9 +81,14 @@ def make_backend(token: str) -> AccessBackend:
                 timeout=10.0,
                 trust_env=False,
                 follow_redirects=False,
+                proxy=proxy,
             )
 
-    return HikerBackend(client=DesktopClient())
+    if max_pages is None:
+        return HikerBackend(client=DesktopClient(), retry_decorator=retry_decorator)
+    return HikerBackend(
+        client=DesktopClient(), retry_decorator=retry_decorator, max_pages=max_pages
+    )
 
 
 async def _await_worker(
@@ -96,7 +127,29 @@ async def _await_worker(
     return worker.result()
 
 
-async def _close(backend: AccessBackend, deadline: float) -> None:
+def access_code(failure: BaseException) -> str:
+    """The shared provider-failure mapping for every desktop network call.
+
+    One ladder so credential validation and the lookup reads name the same
+    condition with the same code; callers that know more about their own
+    surface (a missing or private target) map that before asking here.
+    """
+    return (
+        "invalid_token"
+        if isinstance(failure, AuthInvalid)
+        else "quota_exhausted"
+        if isinstance(failure, QuotaExhausted)
+        else "rate_limited"
+        if isinstance(failure, RateLimited)
+        else "network_error"
+        if isinstance(failure, Transient)
+        else "operation_timeout"
+        if isinstance(failure, TimeoutError)
+        else "access_unconfirmed"
+    )
+
+
+async def _close(backend: ClosableBackend, deadline: float) -> None:
     await _await_worker(asyncio.create_task(backend.aclose()), deadline)
 
 
@@ -134,19 +187,6 @@ async def validate_candidate(token: str) -> int:
     if failure is not None:
         if isinstance(failure, DesktopError):
             raise failure from None
-        code = (
-            "invalid_token"
-            if isinstance(failure, AuthInvalid)
-            else "quota_exhausted"
-            if isinstance(failure, QuotaExhausted)
-            else "rate_limited"
-            if isinstance(failure, RateLimited)
-            else "network_error"
-            if isinstance(failure, Transient)
-            else "operation_timeout"
-            if isinstance(failure, TimeoutError)
-            else "access_unconfirmed"
-        )
-        raise DesktopError(code) from None
+        raise DesktopError(access_code(failure)) from None
     assert remaining is not None
     return remaining

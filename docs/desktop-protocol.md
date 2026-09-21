@@ -81,6 +81,10 @@ concurrent database changes fail closed and may require a fresh inspection.
 | `quota_exhausted` | Provider rejected access due to exhausted quota. |
 | `rate_limited`, `network_error`, `access_unconfirmed` | Validation did not establish access; no candidate is saved. |
 | `operation_timeout` | The budget expired; inspect before retrying. |
+| `target_not_found` | The looked-up account does not exist, or no longer does. |
+| `target_private` | The looked-up account does not share the requested data publicly. |
+| `target_unavailable` | The provider refused the request for that account and named no cause. |
+| `provider_response_invalid` | The provider's answer could not be read safely. |
 | `profile_busy` | Another profile operation holds the lock. |
 | `profile_ownership` | Profile paths, permissions or ownership cannot be trusted. |
 | `not_configured`, `already_configured` | Setup state does not match the requested operation. |
@@ -104,7 +108,9 @@ rollback. Provider validation and close share a maximum 30-second wait. Started
 native workers drain before management/profile locks release. Cancellation-
 resistant third-party tasks or synchronous blocking still require the caller's
 hard process deadline; a JSON error alone is not proof that the child exited.
-Child stderr is not a UI message.
+Child stderr is not a UI message. The on-demand lookups below are a third
+budget class, "network read": one 60-second composite budget per request,
+close included, with no retry ladder.
 
 If a kickstart client times out, the controller does not repeat the command: it
 observes the owned service within the remaining budget. Only verified native
@@ -500,3 +506,122 @@ New static codes: `home_invalid`, `home_backend_unsupported`,
 `service_ownership_unknown` and `service_config_mismatch` (none retryable).
 Existing codes keep their meaning; adopted homes with an incompatible database
 report `schema_mismatch`.
+## L1 on-demand lookups
+
+Two capabilities, `lookup.profile` and `lookup.activity`, are appended after
+the C3 names, so the table is 27 long. They ask the provider about an account
+the user has just typed. They are the only operations that make a provider
+request without changing anything, and they exist so the app can show an
+account before the user decides to watch it.
+
+| Operation | Exact params | Budget | Effect |
+| --- | --- | --- | --- |
+| `lookup.profile` | `{"username":"..."}` | network read, 60 s | Resolve the username and read the profile: 2 provider requests, at most 4. |
+| `lookup.activity` | `{"target_pk":"...","window":12\|30\|50}` | network read, 60 s | One fetch of the most recent `window` posts, then every analysis below from that single list: 1 request plus one per extra page needed to reach the window, at most 6 page requests (12 with retries). |
+
+`username` is canonicalized exactly like `watches.add` and `snapshots.targets`,
+in the same order (leading `@`, then surrounding whitespace, then lowercase),
+and violations are `invalid_params`. `target_pk` is the canonical positive
+decimal string of at most 64 digits the history operations use; it comes from
+the `lookup.profile` result, so the username is never resolved twice. `window`
+is an actual integer, one of 12, 30 or 50 — the sizes whose cost the window
+states before the click. Extra keys are rejected before the profile, the
+provider or the lookup module is loaded.
+
+`lookup.profile` returns `{kind:"lookup_profile", target_pk, access, fields,
+unknown_fields, quota_remaining}`. `access` is `public` or `private`. `fields`
+carries exactly the tracked profile vocabulary `snapshots.read` reports, in the
+same declaration order and with the same value typing — `username`, `full_name`,
+`biography`, `external_url`, `is_verified`, `is_business`, `is_private`,
+`follower_count`, `following_count`, `media_count`, `public_email`,
+`public_phone`, `business_category` — and no avatar or banner hash, which only
+a stored snapshot has. A tracked field this provider cannot supply is named in
+`unknown_fields` rather than invented, so one renderer serves a lookup and a
+saved snapshot — such a renderer must treat the `avatar` and `banner` keys as
+optional, since only `snapshots.read` ever carries them. The CLI's third
+`user_about` request is deliberately not made: every field above comes from
+the profile payload itself, so it would buy this result nothing. A deleted or
+unknown account is `target_not_found`.
+
+`lookup.activity` returns `{kind:"lookup_activity", target_pk, window,
+analyzed, geo, timeline, hashtags, mentions, locations, likes,
+quota_remaining}`, all of it computed from the one post window and none of it
+from a per-post request:
+
+- `geo`: `geotagged`, `anchor` and `places` (up to 10 `{name,lat,lng,count}`),
+  `centroid` `{lat,lng}` or null, `radius_km` or null.
+- `timeline`: `hour_of_day` (24 UTC counts), `day_of_week` (7 counts, Monday
+  first), `first_post_at` and `last_post_at` in Unix seconds or null.
+- `hashtags`, `mentions`, `locations`: up to 20 `{key,count}` each, ordered by
+  count descending then key ascending.
+- `likes`: `total`, `average` and up to 5 `top_posts` `{code,like_count}`.
+
+An account with no posts returns that same shape with zeros, nulls and empty
+lists. `radius_km` and `likes.average` are rounded to three decimals.
+
+The host must gate `lookup.activity` on the `access` field of the preceding
+`lookup.profile`: the activity operation receives a bare pk and cannot tell a
+private account from an empty one, because a provider may answer a private
+account's media with an empty page. An `analyzed: 0` result is therefore not
+proof of an account without posts. When the provider does refuse, the answer
+is `target_private` if it named privacy and `target_unavailable` if it merely
+refused; an account that vanished between the two operations is
+`target_not_found`.
+
+Every string and list is bounded so the response stays far below the 2 MiB
+output budget: 2,048 characters for a biography or external URL, 320 for an
+email, 255 for a username, name or category, 120 for a place name or a
+hashtag, mention and location key, 64 for a phone and a post code, plus the
+list lengths above. Counts are clamped to non-negative integers. A post whose
+geotag coordinates JSON cannot carry (a non-finite latitude or longitude) is
+not counted as geotagged at all, so `geotagged`, `places`, `centroid` and
+`radius_km` describe the same posts; it still counts towards `analyzed` and
+towards its location name. Nothing else is dropped.
+
+**Paid requests are capped by count, not only by the clock.** `lookup.profile`
+makes 2 requests (resolve, profile) and never more than 4, because each of the
+two may be retried once after a transient failure. `lookup.activity` buys at
+most **6 page requests** — 12 with the same one retry each — whatever the
+provider's cursor claims: 6 covers the largest window (50) at any page of nine
+items or more, and a page of 12 reaches it in 5. A cursor that keeps offering
+thin or empty pages stops at that ceiling and the analysis answers with what
+was already paid for; `analyzed` is then smaller than `window` and is the true
+number of posts inspected. `analyzed < window` therefore means either the
+account has no more posts or the ceiling was reached — never that posts were
+silently ignored. No lookup has any other paid call: no `user_about`, no
+balance request, no per-post fan-out, no media download.
+
+`quota_remaining` is what the provider's response headers reported during this
+very call, or null: never an extra balance request.
+
+The network-read budget is one 60-second composite budget per request, with
+time reserved for closing the HTTP client; past the deadline the worker is
+cancelled exactly as credential validation cancels its own and the answer is
+`operation_timeout`. Inside it the operation fails fast: a rate limit is
+reported at once as `rate_limited` and never slept on, a transient failure is
+retried once quickly, and the CLI's five-attempt ladder (which can wait
+minutes for a cooldown) is not used. The provider client is built like the
+credential validator's — explicit timeout, no environment lookup, no redirects
+— plus the profile's own proxy when its configuration has one. Shared failures
+map exactly as credential validation maps them (`invalid_token`,
+`quota_exhausted`, `rate_limited`, `network_error`, `access_unconfirmed`,
+`operation_timeout`); a profile without a token is `not_configured`. Provider
+exception text never reaches the client.
+
+Two failures are named by the lookups alone. A bare provider 403 becomes
+`target_unavailable`, which deliberately claims nothing about the cause: it may
+be the target (restricted, region-locked, login-walled) or this account's own
+access, and the provider does not say which — so it is never reported as the
+account being private, and never as a rejected token. An answer this core
+cannot read (an identity the app could not reuse, a value of the wrong type, a
+timestamp no calendar can represent) becomes `provider_response_invalid`. Both
+are non-retryable, like `target_not_found` and `target_private`: the same
+request would buy the same answer. The one reused code that is marked retryable
+on this surface is `access_unconfirmed`, which here means an unexpected
+provider failure and may legitimately be retried once by a person, not
+automatically.
+
+Both operations are pure reads of the network: no `cli_history` row, no file
+under `output/`, no snapshot, no write to the store, and the database is not
+opened at all. They take no profile or service lock either, so they work while
+the watch service is running under the same profile and token.

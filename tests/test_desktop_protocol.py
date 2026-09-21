@@ -167,6 +167,8 @@ async def test_hello() -> None:
                 "service.uninstall",
                 "home.inspect",
                 "home.select",
+                "lookup.profile",
+                "lookup.activity",
             ],
         },
     }
