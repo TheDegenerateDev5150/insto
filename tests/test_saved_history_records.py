@@ -119,7 +119,7 @@ def test_absent_old_field_is_unknown_but_null_is_known(connection):
         row(connection, '{"biography":"new","full_name":"Alice"}', identifier=2, stamp=2),
         lambda: None,
     )
-    result = comparison(old, new, lambda: None)
+    result = comparison(old, new, lambda: None, stable_since=0)
     assert result["changes"] == [{"field": "biography", "old": None, "new": "new"}]
     assert "full_name" in result["unknown_fields"]
     assert "biography" not in result["unknown_fields"]
@@ -133,11 +133,18 @@ def test_identity_precision_ties_and_hash_semantics(connection):
     newer = snapshot(
         row(connection, fields, identifier=9007199254740994, stamp=3, avatar="b" * 64), lambda: None
     )
-    result = comparison(older, newer, lambda: None)
+    result = comparison(older, newer, lambda: None, stable_since=3)
     assert result["older"]["id"] == "9007199254740993"
     assert result["newer"]["captured_at"] == 3
     assert result["changes"] == [{"field": "avatar", "old": "a" * 64, "new": "b" * 64}]
     assert result["unknown_fields"] == []
+    # The same pair is not comparable when the marker is absent or younger than
+    # the older capture: the stored digests were produced by different
+    # algorithms, so neither `changes` nor `unknown_fields` may claim anything.
+    for stable_since in (None, 4):
+        blind = comparison(older, newer, lambda: None, stable_since=stable_since)
+        assert blind["changes"] == []
+        assert blind["unknown_fields"] == []
     assert (
         metadata(
             connection.execute("SELECT " + PROJECTION + " FROM snapshots LIMIT 1").fetchone()

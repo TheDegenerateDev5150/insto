@@ -71,7 +71,12 @@ def _pair(reader: Reader, params: dict[str, Any], check: Check) -> dict[str, Any
         raise DesktopError("snapshot_identity_mismatch")
     if older_meta.key >= newer_meta.key:
         raise DesktopError("invalid_params")
-    return comparison(snapshot(before, check), snapshot(after, check), check)
+    return comparison(
+        snapshot(before, check),
+        snapshot(after, check),
+        check,
+        stable_since=reader.media_hash_stable_since(),
+    )
 
 
 def _single(reader: Reader, params: dict[str, Any], check: Check) -> dict[str, Any]:
@@ -96,6 +101,9 @@ def _pages(reader: Reader, operation: str, params: dict[str, Any], check: Check)
         return _page([], None, 0)
     cap = 2000 if searching else (params["limit"] if listing else 200)
     target_filter = None if searching else params["target_pk"]
+    # One read of the media-hash marker per request: it cannot change inside
+    # the single read transaction this request runs in.
+    stable_since = None if searching or listing else reader.media_hash_stable_since()
     budget = PageBudget(check)
     seen: set[str] = set()
     scanned = 0
@@ -131,7 +139,12 @@ def _pages(reader: Reader, operation: str, params: dict[str, Any], check: Check)
                     if previous is None:
                         item = {"kind": "baseline", "snapshot": current_meta.dto()}
                     else:
-                        difference = comparison(snapshot(previous, check), current, check)
+                        difference = comparison(
+                            snapshot(previous, check),
+                            current,
+                            check,
+                            stable_since=stable_since,
+                        )
                         if difference["changes"] or difference["unknown_fields"]:
                             item = difference
                             if difference["unknown_fields"]:

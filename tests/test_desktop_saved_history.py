@@ -9,7 +9,24 @@ from insto.desktop.errors import DesktopError
 from insto.desktop.history import run
 from insto.desktop.history_params import validate_params
 from insto.desktop.protocol import MAX_OUTPUT_BYTES, encode
-from insto.service.history import _PROFILE_TRACKED_FIELDS
+from insto.service.history import _PROFILE_TRACKED_FIELDS, MEDIA_HASH_STABLE_SINCE_KEY
+
+
+def mark_stable(profile, stamp=0):
+    """Stamp the marker a real snapshot writer would have written."""
+    with closing(sqlite3.connect(profile.home / "store.db")) as db, db:
+        db.execute(
+            "INSERT OR REPLACE INTO _meta(key,value) VALUES (?,?)",
+            (MEDIA_HASH_STABLE_SINCE_KEY, str(stamp)),
+        )
+
+
+def hashes(profile, identifier, avatar=None, banner=None):
+    with closing(sqlite3.connect(profile.home / "store.db")) as db, db:
+        db.execute(
+            "UPDATE snapshots SET avatar_url_hash=?, banner_url_hash=? WHERE id=?",
+            (avatar, banner, identifier),
+        )
 
 
 def fields(**updates):
@@ -100,11 +117,9 @@ def test_read_reports_the_same_fields_and_typing_as_compare(monitoring_profile):
         media_count=5,
     )
     identifier = insert(p, stamp=2, payload=payload)
-    with closing(sqlite3.connect(p.home / "store.db")) as db, db:
-        db.execute(
-            "UPDATE snapshots SET avatar_url_hash=?, banner_url_hash=? WHERE id=?",
-            (avatar, banner, identifier),
-        )
+    hashes(p, identifier, avatar, banner)
+    # Both captures are at or after the marker, so the media hashes compare.
+    mark_stable(p, 1)
     result = request(p, "snapshots.read", {"target_pk": "7", "snapshot_id": identifier})
     assert result == {
         "kind": "snapshot_fields",
@@ -710,3 +725,81 @@ def test_sqlite_busy_is_bounded_and_explicit(monitoring_profile):
     finally:
         writer.rollback()
         writer.close()
+
+
+def test_media_hashes_are_compared_only_on_both_sides_of_the_stable_marker(monitoring_profile):
+    p = monitoring_profile
+    old = insert(p, stamp=5)
+    new = insert(p, stamp=9)
+    hashes(p, old, avatar="a" * 64, banner="c" * 64)
+    hashes(p, new, avatar="b" * 64, banner="d" * 64)
+    params = {"target_pk": "7", "older_id": old, "newer_id": new}
+
+    # No marker: the old row may hold a whole-URL digest, so nothing is claimed.
+    result = request(p, "snapshots.compare", params)
+    assert result["changes"] == []
+    assert result["unknown_fields"] == []
+    assert request(p, "changes.list", {"target_pk": "7"})["items"] == [
+        {"kind": "baseline", "snapshot": {"id": old, "target_pk": "7", "captured_at": 5}}
+    ]
+
+    # Marker after the older capture: still not comparable.
+    mark_stable(p, 7)
+    assert request(p, "snapshots.compare", params)["changes"] == []
+    assert [item["kind"] for item in request(p, "changes.list", {"target_pk": "7"})["items"]] == [
+        "baseline"
+    ]
+
+    # Marker at or before both captures: a real swap is reported again.
+    mark_stable(p, 5)
+    assert request(p, "snapshots.compare", params)["changes"] == [
+        {"field": "avatar", "old": "a" * 64, "new": "b" * 64},
+        {"field": "banner", "old": "c" * 64, "new": "d" * 64},
+    ]
+    feed = request(p, "changes.list", {"target_pk": "7"})
+    assert [item["kind"] for item in feed["items"]] == ["comparison", "baseline"]
+    assert feed["items"][0]["unknown_fields"] == []
+
+    # `snapshots.read` never gates: it reports the stored hash as it is.
+    stored = request(p, "snapshots.read", {"target_pk": "7", "snapshot_id": old})
+    assert stored["fields"]["avatar"] == "a" * 64
+    with closing(sqlite3.connect(p.home / "store.db")) as db, db:
+        db.execute("DELETE FROM _meta WHERE key=?", (MEDIA_HASH_STABLE_SINCE_KEY,))
+    assert request(p, "snapshots.read", {"target_pk": "7", "snapshot_id": old}) == stored
+
+
+@pytest.mark.parametrize("value", ["", "-1", "9.5", "later", "99999999999999999999"])
+def test_an_unreadable_marker_reads_as_absent_rather_than_comparable(monitoring_profile, value):
+    p = monitoring_profile
+    old = insert(p, stamp=5)
+    new = insert(p, stamp=9)
+    hashes(p, old, avatar="a" * 64)
+    hashes(p, new, avatar="b" * 64)
+    mark_stable(p, value)
+    params = {"target_pk": "7", "older_id": old, "newer_id": new}
+    assert request(p, "snapshots.compare", params)["changes"] == []
+
+
+def test_comparing_never_writes_the_marker_into_the_store(monitoring_profile, monkeypatch):
+    p = monitoring_profile
+    old = insert(p, stamp=5)
+    new = insert(p, stamp=9)
+    hashes(p, old, avatar="a" * 64)
+    hashes(p, new, avatar="b" * 64)
+    from insto.desktop import database
+    from insto.desktop import history as desktop_history
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("the saved-history reader must never open the store for writing")
+
+    monkeypatch.setattr(database, "write_database", forbidden)
+    monkeypatch.setattr(desktop_history, "write_database", forbidden, raising=False)
+    request(p, "snapshots.compare", {"target_pk": "7", "older_id": old, "newer_id": new})
+    request(p, "changes.list", {"target_pk": "7"})
+    with closing(sqlite3.connect(p.home / "store.db")) as db:
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM _meta WHERE key=?", (MEDIA_HASH_STABLE_SINCE_KEY,)
+            ).fetchone()[0]
+            == 0
+        )

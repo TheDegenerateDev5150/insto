@@ -10,13 +10,34 @@ from pathlib import Path
 import pytest
 
 from insto.exceptions import BackendError
-from insto.models import Profile
+from insto.models import Profile, Snapshot
 from insto.service.history import (
     CLI_HISTORY_RETENTION_DAYS,
+    MEDIA_HASH_STABLE_SINCE_KEY,
     SNAPSHOT_MAX_PER_TARGET,
     SNAPSHOT_RETENTION_DAYS,
     HistoryStore,
     hash_url,
+)
+
+# One real avatar URL observed from the HikerAPI backend, with the parts that
+# rotate between two fetches of the very same picture: the edge host, the signed
+# `oh`/`oe`/`_nc_ohc` parameters and the `stp` size variant.
+_AVATAR_PATH = "/v/t51.82787-19/550891366_18667771684001321_1383210656577177067_n.jpg"
+_AVATAR_A = (
+    "https://scontent-lax3-2.cdninstagram.com" + _AVATAR_PATH + "?stp=dst-jpg_e0_s150x150_tt6"
+    "&_nc_ht=scontent-lax3-2.cdninstagram.com&_nc_ohc=zQKhYsAesT4Q7kNvwFn_CpJ"
+    "&oh=00_Af08wL20KygJVgRxKHn3UV7yz-vUPQ1-jHemItgjVzXErA&oe=69F70B27"
+)
+_AVATAR_A_AGAIN = (
+    "https://instagram.fwaw2-1.fbcdn.net" + _AVATAR_PATH + "?stp=dst-jpg_e0_s1080x1080_tt6"
+    "&_nc_ht=instagram.fwaw2-1.fbcdn.net&_nc_ohc=OTHERohcTOKEN0000000000"
+    "&oh=00_AfZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ&oe=6A0001FF"
+)
+_AVATAR_B = (
+    "https://scontent-lax3-2.cdninstagram.com"
+    "/v/t51.82787-19/999999999_18667771684001321_1383210656577177067_n.jpg"
+    "?stp=dst-jpg_e0_s150x150_tt6&oh=00_Af08wL20KygJVgRxKHn3UV&oe=69F70B27"
 )
 
 
@@ -228,6 +249,109 @@ def test_url_hashing_helper() -> None:
     assert h1 == h2
     assert h1 != h3
     assert len(h1) == 64  # sha256 hex
+
+
+def test_hash_url_identifies_the_media_not_the_signed_url() -> None:
+    # Same picture, other edge host, other signed query, other size variant.
+    assert hash_url(_AVATAR_A) == hash_url(_AVATAR_A_AGAIN)
+    # A size variant that lives in the path instead of the query is the same
+    # picture too — the final segment is the identity.
+    assert hash_url(_AVATAR_A) == hash_url(
+        "https://scontent.cdninstagram.com/v/t51.2885-19/s150x150"
+        + _AVATAR_PATH[len("/v/t51.82787-19") :]
+    )
+    # A different upload is a different hash.
+    assert hash_url(_AVATAR_A) != hash_url(_AVATAR_B)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "not a url",
+        "https://",
+        "https://cdn.example",
+        "https://cdn.example/",
+        "ftp://cdn.example/a.jpg",
+        "data:image/png;base64,AAAA",
+        "https://[oops/a.jpg",  # urlsplit raises ValueError
+    ],
+)
+def test_hash_url_falls_back_to_the_whole_value_when_it_is_not_a_media_url(url: str) -> None:
+    import hashlib
+
+    digest = hash_url(url)
+    assert digest == hashlib.sha256(url.encode("utf-8")).hexdigest()
+    assert len(digest) == 64 and digest == digest.lower()
+
+
+def test_hash_url_is_always_a_lowercase_sha256_hex_digest() -> None:
+    for url in (_AVATAR_A, _AVATAR_B, "not a url", "https://cdn.example/Ünïcødé .jpg"):
+        digest = hash_url(url)
+        assert digest is not None
+        assert len(digest) == 64
+        assert all(character in "0123456789abcdef" for character in digest)
+
+
+def test_media_hash_marker_is_stamped_once_and_never_moved(store: HistoryStore) -> None:
+    assert store.media_hash_stable_since() is None
+    p = _make_profile(pk="42", avatar_url=_AVATAR_A)
+    store.add_snapshot(store.snapshot_from_profile(p, post_pks=[]))
+    first = store.media_hash_stable_since()
+    assert first is not None and first <= int(time.time())
+    store.add_snapshot(
+        Snapshot(target_pk="42", captured_at=first + 3600, avatar_url_hash=hash_url(_AVATAR_B))
+    )
+    assert store.media_hash_stable_since() == first
+
+
+def test_diff_ignores_media_hashes_of_a_snapshot_taken_before_the_marker(
+    store: HistoryStore,
+) -> None:
+    # A row written by the previous algorithm: a whole-URL digest, no marker.
+    old = int(time.time()) - 3600
+    store._conn.execute(
+        "INSERT INTO snapshots(target_pk, captured_at, profile_fields_json, "
+        "last_post_pks_json, avatar_url_hash, banner_url_hash) VALUES(?, ?, '{}', '[]', ?, ?)",
+        ("42", old, "a" * 64, "b" * 64),
+    )
+    p = _make_profile(pk="42", avatar_url=_AVATAR_A, banner_url=_AVATAR_B)
+    assert store.media_hash_stable_since() is None
+    changes = store.diff("42", p)["changes"]
+    assert "avatar" not in changes and "banner" not in changes
+
+    # Saving a snapshot now stamps the marker, but the old row still predates it.
+    store.add_snapshot(store.snapshot_from_profile(p, post_pks=[]))
+    store._conn.execute("DELETE FROM snapshots WHERE captured_at > ?", (old,))
+    assert store.media_hash_stable_since() is not None
+    changes = store.diff("42", p)["changes"]
+    assert "avatar" not in changes and "banner" not in changes
+
+
+def test_diff_reports_a_real_swap_but_not_a_re_signed_url(store: HistoryStore) -> None:
+    p = _make_profile(pk="42", avatar_url=_AVATAR_A)
+    store.add_snapshot(store.snapshot_from_profile(p, post_pks=[]))
+
+    # The same picture fetched again through another edge with a fresh signature.
+    p.avatar_url = _AVATAR_A_AGAIN
+    assert store.diff("42", p)["changes"] == {}
+
+    p.avatar_url = _AVATAR_B
+    assert store.diff("42", p)["changes"]["avatar"] == {
+        "old": hash_url(_AVATAR_A),
+        "new": hash_url(_AVATAR_B),
+    }
+
+
+def test_marker_and_snapshot_are_written_in_one_transaction(store: HistoryStore) -> None:
+    p = _make_profile(pk="42", avatar_url=_AVATAR_A)
+    store.add_snapshot(store.snapshot_from_profile(p, post_pks=[]))
+    rows = store._conn.execute(
+        "SELECT value FROM _meta WHERE key = ?", (MEDIA_HASH_STABLE_SINCE_KEY,)
+    ).fetchall()
+    assert len(rows) == 1
+    snap = store.last_snapshot("42")
+    assert snap is not None
+    assert int(rows[0]["value"]) <= snap.captured_at
 
 
 def test_snapshot_from_profile_hashes_urls(store: HistoryStore) -> None:

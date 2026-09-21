@@ -10,7 +10,11 @@ from collections.abc import Callable, Generator
 from dataclasses import dataclass
 from typing import Any
 
-from insto.service.history import _PROFILE_TRACKED_FIELDS
+from insto.service.history import (
+    _PROFILE_TRACKED_FIELDS,
+    MEDIA_HASH_STABLE_SINCE_KEY,
+    media_hashes_comparable,
+)
 
 Check = Callable[[], None]
 RAW_LIMIT = 65536
@@ -19,6 +23,7 @@ MAX_ID = 9223372036854775807
 _PK = re.compile(r"[1-9][0-9]{0,63}")
 _USER = re.compile(r"[A-Za-z0-9._]{1,255}")
 _HASH = re.compile(r"[0-9a-f]{64}")
+_STAMP = re.compile(r"[0-9]{1,19}")
 _BOOLS = {"is_verified", "is_business", "is_private"}
 _COUNTS = {"follower_count", "following_count", "media_count"}
 _BYTES = "(length(CAST(profile_fields_json AS BLOB)) + length(CAST(last_post_pks_json AS BLOB)))"
@@ -184,7 +189,24 @@ def snapshot(row: sqlite3.Row, check: Check) -> SavedSnapshot:
     return SavedSnapshot(meta, fields, row["avatar"], row["banner"])
 
 
-def comparison(old: SavedSnapshot, new: SavedSnapshot, check: Check) -> dict[str, Any]:
+def comparison(
+    old: SavedSnapshot,
+    new: SavedSnapshot,
+    check: Check,
+    *,
+    stable_since: int | None,
+) -> dict[str, Any]:
+    """Compare two saved snapshots. `stable_since` gates the media hashes.
+
+    `stable_since` is `Reader.media_hash_stable_since()`. When either side was
+    captured before it (or it is absent) the stored avatar/banner digests were
+    produced by different algorithms and cannot be told apart from a real
+    picture swap, so the pair is left out of `changes` entirely. It is not
+    listed in `unknown_fields` either: that list means "this snapshot holds no
+    value for the field", while both rows do hold a digest here, and an entry
+    there would turn every pre-transition pair into an `incomplete` item in
+    `changes.list` — the very per-check noise this gate removes.
+    """
     check()
     changes: list[dict[str, Any]] = []
     unknown: list[str] = []
@@ -194,10 +216,11 @@ def comparison(old: SavedSnapshot, new: SavedSnapshot, check: Check) -> dict[str
             unknown.append(field)
         elif old.fields[field] != new.fields[field]:
             changes.append({"field": field, "old": old.fields[field], "new": new.fields[field]})
-    for field in ("avatar", "banner"):
-        before, after = getattr(old, field), getattr(new, field)
-        if before != after:
-            changes.append({"field": field, "old": before, "new": after})
+    if media_hashes_comparable(stable_since, old.meta.captured_at, new.meta.captured_at):
+        for field in ("avatar", "banner"):
+            before, after = getattr(old, field), getattr(new, field)
+            if before != after:
+                changes.append({"field": field, "old": before, "new": after})
     check()
     return {
         "kind": "comparison",
@@ -274,6 +297,31 @@ class Reader:
     def __init__(self, connection: sqlite3.Connection, check: Check) -> None:
         self.connection = connection
         self.check = check
+
+    def media_hash_stable_since(self) -> int | None:
+        """Read the `media_hash_stable_since` marker; never write it.
+
+        The connection is opened `query_only`, and this reader only ever
+        SELECTs: the marker is the snapshot writer's to stamp. An absent,
+        duplicated or non-numeric value reads as "unknown", which makes every
+        stored avatar/banner pair not comparable — the safe direction.
+        """
+        self.check()
+        cursor = self.connection.execute(
+            "SELECT value FROM _meta WHERE key=? LIMIT 2", (MEDIA_HASH_STABLE_SINCE_KEY,)
+        )
+        try:
+            rows = cursor.fetchall()
+        finally:
+            cursor.close()
+        self.check()
+        if len(rows) != 1:
+            return None
+        value = rows[0][0]
+        if type(value) is not str or _STAMP.fullmatch(value) is None:
+            return None
+        stamp = int(value)
+        return stamp if 0 <= stamp <= MAX_TIME else None
 
     def ceiling(self) -> int:
         self.check()
