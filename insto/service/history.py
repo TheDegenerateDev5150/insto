@@ -21,12 +21,10 @@ Three tables hold session state:
   diffing renames / bio edits / pfp swaps. Pruned to 30 days *and* a max of
   100 rows per target_pk.
 
-A `_meta(key, value)` table carries `schema_version`, the daemon's
-`first_check_attempted:<user>` markers (see `watch_daemon`) and
-`media_hash_stable_since` (the unix time from which `avatar_url_hash` /
-`banner_url_hash` hold the stable media identity rather than a whole CDN URL).
-It is a generic key/value store created in every schema version, so a marker
-needs no column and no migration. Ordered entries in
+A `_meta(key, value)` table carries `schema_version` and the daemon's
+`first_check_attempted:<user>` markers (see `watch_daemon`). It is a generic
+key/value store created in every schema version, so a marker needs no column and
+no migration. Ordered entries in
 `_MIGRATIONS` advance older stores to `_SCHEMA_VERSION`. Migration runs under
 `BEGIN IMMEDIATE` so a second insto process attempting the same migration
 blocks on the SQLite write lock and then re-checks the version (no-op
@@ -48,7 +46,7 @@ import re
 import sqlite3
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, TypeVar
 from urllib.parse import urlsplit
@@ -112,14 +110,24 @@ SNAPSHOT_MAX_PER_TARGET = 100
 # `schema_version` where the pinned desktop protocol expects it.
 _FIRST_CHECK_KEY = "first_check_attempted:"
 
-# `_meta` key holding the unix time from which `avatar_url_hash` /
-# `banner_url_hash` are the stable media identity (see `hash_url`). Written once
-# by whichever writer first stores a snapshot with the new algorithm; older rows
-# keep whole-URL digests that cannot be recomputed, so a pair that reaches back
-# before this moment is not comparable. Like the first-check markers it lives in
-# the generic `_meta` table, so `schema_version` stays where the pinned desktop
-# protocol expects it.
-MEDIA_HASH_STABLE_SINCE_KEY = "media_hash_stable_since"
+# Which algorithm produced a row's `avatar_url_hash` / `banner_url_hash`.
+# 1 (never written: it is the absence of the key) is the sha256 of the whole
+# signed CDN URL; 2 is the sha256 of the media identity (see `hash_url`). The
+# value is a per-row sentinel kept inside the existing `profile_fields_json`
+# payload, so it needs no column, no `_meta` key and no migration, and
+# `schema_version` stays where the pinned desktop protocol expects it.
+#
+# Per row rather than one moment per store on purpose: this very version is on
+# PyPI as 0.7.22, and an older CLI pointed at the same `~/.insto/store.db` keeps
+# writing whole-URL digests after the upgrade. A timestamp would call those rows
+# comparable; a sentinel the old writer does not know about cannot.
+#
+# It never reaches a reader: every consumer of `profile_fields` iterates
+# `_PROFILE_TRACKED_FIELDS`, and the read-only record validator skips (rather
+# than rejects) keys outside that tuple — in this version and in 0.7.22
+# — so an older insto reading a newer row ignores it.
+MEDIA_HASH_ALGO_FIELD = "_media_hash_algo"
+MEDIA_HASH_ALGO = 2
 
 _MEDIA_URL_SCHEMES = frozenset({"http", "https"})
 
@@ -165,9 +173,16 @@ def _media_identity(url: str) -> str:
     where only the last path segment names the image: the size variant lives in
     the query (`s150x150` inside `stp`) or, in older shapes, in an extra path
     segment (`/s150x150/`), and the bucket segment (`t51.2885-19` →
-    `t51.82787-19`) is migrated server-side. Both mappers also fall back from
-    `profile_pic_url_hd` to `profile_pic_url`, which is the same file at another
-    size. The final segment survives all of that, so it is the identity.
+    `t51.82787-19`) is migrated server-side. The final segment survives all of
+    that, so it is the identity.
+
+    What this does *not* claim: both mappers fall back from `profile_pic_url_hd`
+    to `profile_pic_url`, and there is no captured pair of those two fields to
+    show whether they share a file name. If a flip between them ever changes the
+    final segment it costs one false `avatar` change per flip, not one per check
+    — the repository's own fixtures (`tests/fixtures/hiker/profile_public.json`)
+    model the two as `avatar.jpg` and `avatar_hd.jpg`, i.e. as differing. Do not
+    narrow this to an upload-id prefix without a real pair to test against.
 
     Anything that is not an http(s) URL with a non-empty path is returned whole,
     which keeps the pre-existing behaviour for unparsable input.
@@ -191,28 +206,38 @@ def hash_url(url: str | None) -> str | None:
     fetched an hour later through another edge host with fresh signed query
     parameters hashes the same. The name is kept because it is the module's
     public helper and `avatar_url_hash` / `banner_url_hash` still hold a
-    64-character lowercase sha256 hex digest, which both the read-only reader
-    and the desktop host validate.
+    64-character lowercase sha256 hex digest, the shape the read-only record
+    validator enforces.
     """
     if not url:
         return None
     return hashlib.sha256(_media_identity(url).encode("utf-8")).hexdigest()
 
 
-def media_hashes_comparable(
-    stable_since: int | None,
-    older_captured_at: int,
-    newer_captured_at: int,
-) -> bool:
-    """True when two capture times may have their avatar/banner hashes compared.
+def media_hashes_stable(profile_fields: Mapping[str, Any]) -> bool:
+    """True when a snapshot's avatar/banner hashes use the current identity.
 
-    Rows written before `MEDIA_HASH_STABLE_SINCE_KEY` hold digests of the whole
-    URL and cannot be recomputed (the URLs are not stored), so a difference
-    against them says nothing. Absent marker: nothing is comparable.
+    A row without the sentinel was written by an insto that hashed the whole
+    signed CDN URL. Those digests cannot be recomputed (the URLs are not
+    stored), so a difference against them says nothing about the picture.
+    `type(value) is int` also rejects a `True` that would otherwise compare
+    equal to 1.
     """
-    if stable_since is None:
-        return False
-    return older_captured_at >= stable_since and newer_captured_at >= stable_since
+    value = profile_fields.get(MEDIA_HASH_ALGO_FIELD)
+    return type(value) is int and value == MEDIA_HASH_ALGO
+
+
+def media_hashes_comparable(
+    older_fields: Mapping[str, Any],
+    newer_fields: Mapping[str, Any],
+) -> bool:
+    """True when two snapshots may have their avatar/banner hashes compared.
+
+    Both sides must carry the current algorithm — including the newer one,
+    because an older insto sharing the same store keeps writing whole-URL
+    digests after the upgrade, and such a row can be the newer of a pair.
+    """
+    return media_hashes_stable(older_fields) and media_hashes_stable(newer_fields)
 
 
 def _now_ts() -> int:
@@ -422,58 +447,26 @@ class HistoryStore:
     # ---------------------------------------------------------------- snapshots
 
     def add_snapshot(self, snapshot: Snapshot) -> None:
-        """Store `snapshot`, stamping the media-hash marker on the first write.
-
-        The row and the `media_hash_stable_since` marker land in one
-        `BEGIN IMMEDIATE` transaction, so no snapshot written by this algorithm
-        can ever exist without the marker that declares it comparable. `INSERT
-        OR IGNORE` keeps the first writer's moment: later saves never move it.
-        """
-        stable_since = max(0, min(_now_ts(), snapshot.captured_at))
-
         def _do() -> None:
             with self._lock:
-                self._conn.execute("BEGIN IMMEDIATE")
-                try:
-                    self._conn.execute(
-                        "INSERT OR IGNORE INTO _meta(key, value) VALUES(?, ?)",
-                        (MEDIA_HASH_STABLE_SINCE_KEY, str(stable_since)),
-                    )
-                    self._conn.execute(
-                        """
-                        INSERT INTO snapshots(
-                            target_pk, captured_at, profile_fields_json,
-                            last_post_pks_json, avatar_url_hash, banner_url_hash
-                        ) VALUES(?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            snapshot.target_pk,
-                            snapshot.captured_at,
-                            json.dumps(snapshot.profile_fields, ensure_ascii=False),
-                            json.dumps(snapshot.last_post_pks),
-                            snapshot.avatar_url_hash,
-                            snapshot.banner_url_hash,
-                        ),
-                    )
-                    self._conn.execute("COMMIT")
-                except BaseException:
-                    self._conn.execute("ROLLBACK")
-                    raise
+                self._conn.execute(
+                    """
+                    INSERT INTO snapshots(
+                        target_pk, captured_at, profile_fields_json,
+                        last_post_pks_json, avatar_url_hash, banner_url_hash
+                    ) VALUES(?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        snapshot.target_pk,
+                        snapshot.captured_at,
+                        json.dumps(snapshot.profile_fields, ensure_ascii=False),
+                        json.dumps(snapshot.last_post_pks),
+                        snapshot.avatar_url_hash,
+                        snapshot.banner_url_hash,
+                    ),
+                )
 
         _with_lock_retry(_do)
-
-    def media_hash_stable_since(self) -> int | None:
-        """Unix time from which stored avatar/banner hashes are comparable."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT value FROM _meta WHERE key = ?", (MEDIA_HASH_STABLE_SINCE_KEY,)
-            ).fetchone()
-        if row is None:
-            return None
-        try:
-            return int(row["value"])
-        except (TypeError, ValueError):
-            return None
 
     async def add_snapshot_async(self, snapshot: Snapshot) -> None:
         await asyncio.to_thread(self.add_snapshot, snapshot)
@@ -532,10 +525,9 @@ class HistoryStore:
         and `previous_usernames` (every distinct historical username for
         `target_pk` that does not equal `current.username`, oldest first).
 
-        `avatar` / `banner` are reported only when the stored snapshot was
-        captured at or after `media_hash_stable_since` (see
-        `media_hashes_comparable`); otherwise the pair is silently not
-        comparable rather than a change on every check.
+        `avatar` / `banner` are reported only when the stored snapshot carries
+        the current media-hash algorithm (see `media_hashes_stable`); otherwise
+        the pair is silently not comparable rather than a change on every check.
         """
         last = self.last_snapshot(target_pk)
         prior_names = [n for n in self._all_snapshot_usernames(target_pk) if n != current.username]
@@ -551,12 +543,12 @@ class HistoryStore:
             new = getattr(current, f)
             if old != new:
                 changes[f] = {"old": old, "new": new}
-        # `current` is hashed here and now, so the newer side is always stable;
-        # only the stored side can predate the marker. When it does (or the
-        # marker is absent), the pair is not comparable and neither key is
-        # reported — a whole-URL digest differs from a media-identity digest for
-        # reasons that have nothing to do with the picture.
-        if media_hashes_comparable(self.media_hash_stable_since(), last.captured_at, _now_ts()):
+        # `current` is hashed here and now, so the live side always carries the
+        # current algorithm; only the stored row can be an older writer's. When
+        # it is, the pair is not comparable and neither key is reported — a
+        # whole-URL digest differs from a media-identity digest for reasons that
+        # have nothing to do with the picture.
+        if media_hashes_stable(last.profile_fields):
             cur_avatar = current.avatar_url_hash or hash_url(current.avatar_url)
             cur_banner = current.banner_url_hash or hash_url(current.banner_url)
             if last.avatar_url_hash != cur_avatar:
@@ -575,6 +567,9 @@ class HistoryStore:
         for f in _PROFILE_TRACKED_FIELDS:
             value = getattr(profile, f)
             fields[f] = value
+        # Which algorithm hashed the two URLs below. Not a tracked field, so no
+        # reader ever surfaces it; see `MEDIA_HASH_ALGO_FIELD`.
+        fields[MEDIA_HASH_ALGO_FIELD] = MEDIA_HASH_ALGO
         return Snapshot(
             target_pk=profile.pk,
             captured_at=_now_ts(),
