@@ -10,6 +10,10 @@ MESSAGES: dict[str, tuple[str, bool]] = {
     "network_error": ("Provider access is temporarily unavailable.", True),
     "access_unconfirmed": ("Provider access could not be confirmed.", True),
     "operation_timeout": ("The operation timed out; inspect its state before retrying.", False),
+    # A looked-up account that the provider cannot show. Neither is retryable:
+    # a second identical request within the session gets the same answer.
+    "target_not_found": ("No account matches that lookup.", False),
+    "target_private": ("The account does not share this data publicly.", False),
     "profile_busy": ("Another profile operation is in progress.", True),
     "profile_ownership": ("The profile cannot be managed safely.", False),
     "not_configured": ("The profile is not configured.", False),

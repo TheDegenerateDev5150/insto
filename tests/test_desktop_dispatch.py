@@ -40,7 +40,11 @@ CAPABILITIES = [
     "service.uninstall",
     "home.inspect",
     "home.select",
+    "lookup.profile",
+    "lookup.activity",
 ]
+
+LOOKUP_CAPABILITIES = ["lookup.profile", "lookup.activity"]
 
 C3_CAPABILITIES = [
     "service.inspect",
@@ -69,8 +73,9 @@ def forbid_import(monkeypatch, name):
 async def test_exact_c2_capabilities():
     response = json.loads(await handle(wire("hello", {})))
     assert response["result"]["capabilities"] == list(CAPABILITIES)
-    assert len(CAPABILITIES) == 25
-    assert list(CAPABILITIES[-5:]) == C3_CAPABILITIES
+    assert len(CAPABILITIES) == 27
+    assert list(CAPABILITIES[-7:-2]) == C3_CAPABILITIES
+    assert list(CAPABILITIES[-2:]) == LOOKUP_CAPABILITIES
 
 
 async def test_c3_operations_reach_their_modules(monkeypatch, tmp_path):
@@ -318,3 +323,50 @@ async def test_domain_errors_are_static_and_preserve_id(monkeypatch, code):
         "request_id": "c1",
         "error": {"code": code, "message": message, "retryable": retryable},
     }
+
+
+@pytest.mark.parametrize(
+    "operation,params",
+    [
+        ("lookup.profile", {}),
+        ("lookup.profile", {"username": " @alice"}),
+        ("lookup.profile", {"username": "alice", "token": "offline-sentinel"}),
+        ("lookup.activity", {"target_pk": "7"}),
+        ("lookup.activity", {"target_pk": "07", "window": 12}),
+        ("lookup.activity", {"target_pk": "7", "window": 13}),
+        ("lookup.activity", {"target_pk": "7", "window": True}),
+        ("lookup.activity", {"target_pk": "7", "window": 12, "token": "offline-sentinel"}),
+    ],
+)
+async def test_lookup_params_are_validated_before_importing_lookup(monkeypatch, operation, params):
+    forbid_import(monkeypatch, "lookup")
+    forbid_import(monkeypatch, "profile")
+    raw = await handle(wire(operation, params))
+    assert b"offline-sentinel" not in raw
+    assert json.loads(raw)["error"]["code"] == "invalid_params"
+
+
+async def test_lookup_operations_reach_their_module_with_normalized_params(monkeypatch, tmp_path):
+    from insto.desktop import lookup
+    from insto.desktop.profile import Profile
+
+    calls = []
+    root = tmp_path / "root"
+    monkeypatch.setenv("INSTO_DESKTOP_ROOT", str(root))
+
+    async def run(profile, operation, params):
+        calls.append((profile, operation, params))
+        return {"ok": operation}
+
+    monkeypatch.setattr(lookup, "run", run)
+    assert json.loads(await handle(wire("lookup.profile", {"username": "@Alice"})))["result"] == {
+        "ok": "lookup.profile"
+    }
+    activity = wire("lookup.activity", {"target_pk": "17841400000000001", "window": 30})
+    assert json.loads(await handle(activity))["result"] == {"ok": "lookup.activity"}
+    assert [(operation, params) for _, operation, params in calls] == [
+        ("lookup.profile", {"username": "alice"}),
+        ("lookup.activity", {"target_pk": "17841400000000001", "window": 30}),
+    ]
+    for profile, _, _ in calls:
+        assert isinstance(profile, Profile) and profile.root == root and not profile.adopted

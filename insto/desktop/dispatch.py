@@ -12,6 +12,8 @@ from insto.desktop.history_params import CAPABILITIES as HISTORY_CAPABILITIES
 from insto.desktop.history_params import validate_params as validate_history_params
 from insto.desktop.home_params import CAPABILITIES as HOME_CAPABILITIES
 from insto.desktop.home_params import validate_path
+from insto.desktop.lookup_params import CAPABILITIES as LOOKUP_CAPABILITIES
+from insto.desktop.lookup_params import validate_params as validate_lookup_params
 from insto.desktop.protocol import PROTOCOL_VERSION, ProtocolError, Request, decode, encode
 from insto.desktop.watch_params import CAPABILITIES as WATCH_CAPABILITIES
 from insto.desktop.watch_params import validate_params as validate_watch_params
@@ -40,6 +42,7 @@ CAPABILITIES = (
     *HISTORY_CAPABILITIES,
     *_SERVICE_C3,
     *HOME_CAPABILITIES,
+    *LOOKUP_CAPABILITIES,
 )
 
 
@@ -78,6 +81,14 @@ async def dispatch(request: Request) -> dict[str, Any]:
         from insto.desktop.profile import Profile
 
         return await home.select(Profile.own_from_environment(), path)
+    if operation in LOOKUP_CAPABILITIES:
+        params = validate_lookup_params(operation, request.params)
+        from insto.desktop import lookup
+        from insto.desktop.profile import Profile
+
+        # The lookup owns a 60-second network-read budget of its own; the
+        # 10-second local deadline above bounds storage reads, not a provider.
+        return await lookup.run(Profile.from_environment(), operation, params)
     token_operation = operation in {"setup.configure", "credentials.replace"}
     if token_operation:
         if request.params.keys() != {"token"}:
