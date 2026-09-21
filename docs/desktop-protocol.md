@@ -312,8 +312,9 @@ its `changes` values, so one formatter serves both. It is not gated the way
 `snapshots.compare` is: `snapshots.read` reports the stored digest of a single
 snapshot as it is, including for a row whose hashes no comparison could use.
 Absent tracked fields are listed in `unknown_fields` in the same order
-`snapshots.compare` uses; explicit JSON null is a known value. Its parameters are validated exactly like one side
-of the compare pair, with the same `invalid_params` code. A missing ID returns
+`snapshots.compare` uses; explicit JSON null is a known value. Its parameters
+are validated exactly like one side of the compare pair, with the same
+`invalid_params` code. A missing ID returns
 `snapshot_unavailable`, a snapshot of another target returns
 `snapshot_identity_mismatch`, an unreadable row returns `history_corrupt`, and a
 record over the raw byte cap or a response over the wire budget returns
@@ -324,8 +325,9 @@ snapshot within the same PK and initial ID ceiling. Its earliest retained
 snapshot is `{kind:"baseline",snapshot}`. Fully known unchanged comparisons
 are omitted, and so is a pair whose only difference would be an avatar or
 banner hash that `snapshots.compare` would not report as a picture change:
-it yields no item at all, exactly like an unchanged pair. A comparison with any unknown field has `kind:"incomplete"` and
-the same `older,newer,changes,unknown_fields` shape. Other changed pairs have
+it yields no item at all, exactly like an unchanged pair. A comparison with
+any unknown field has `kind:"incomplete"` and the same
+`older,newer,changes,unknown_fields` shape. Other changed pairs have
 `kind:"comparison"`. These are observations between capture times, not exact
 Instagram event times; follower counts do not identify individual followers.
 
