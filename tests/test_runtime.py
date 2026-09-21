@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
-import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -113,10 +112,14 @@ def _seed_watch(config: Config, *, profile: Profile | None = None) -> None:
     try:
         spec = history.register_watch("alice", 300).spec
         assert spec is not None
-        # The headless daemon now checks a clean never-checked registration at
-        # once. These tests drive the tick explicitly, so record one earlier
-        # success and keep the scheduled loop a full interval away.
-        assert history.update_watch_state(spec, last_ok=int(time.time()))
+        # The headless daemon checks a clean never-checked registration at once.
+        # These tests drive the tick explicitly, so seed a recorded *failure*:
+        # it keeps the scheduled loop a full interval away without pretending the
+        # watch already succeeded, so `_assert_successful_state` still has teeth —
+        # only a real tick can clear `last_error` and set `last_ok`. The error
+        # counter stays 0, so a test that drives one failing tick still lands on
+        # `consecutive_errors == 1` and `active`, not `paused`.
+        assert history.update_watch_state(spec, last_error="seeded-before-first-check")
         if profile is not None:
             history.add_snapshot(history.snapshot_from_profile(profile, post_pks=[]))
     finally:

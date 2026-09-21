@@ -135,10 +135,20 @@ JSON output. In the headless daemon (`insto watch-daemon` and the managed
 LaunchAgent) a registration that has never been checked and carries no error is
 checked right away, so adding an account does something visible instead of
 waiting a full interval; a never-succeeded row that already failed keeps the
-full interval, so a crash or restart loop cannot spend quota on every start. In
-the REPL a new row still waits one interval. Zero delays — new and recovered due
-rows alike — start at offsets 0/2/4 seconds. Subsequent polling is fixed-delay,
-so one target never overlaps itself.
+full interval. That grant is made at most once per registered user and is
+recorded durably *before* the zero-delay task is scheduled, as a
+`first_check_attempted:<user>` row in the generic `_meta` key/value table (no
+schema column, no version bump). The marker survives pause/resume, interval
+edits, `registration_id` rotations and daemon restarts, so none of them buys a
+second paid check and a crash or restart loop cannot spend quota on every start;
+it is dropped only when a reconcile observes that the watch row itself is gone,
+so a genuine remove + add is checked promptly again. A marker that cannot be
+written means no immediate check: the row falls back to its interval rather than
+running a paid check nobody could record. The REPL role neither reads nor writes
+markers and a new row there still waits one interval. Zero delays — new and
+recovered due rows alike — start at offsets 0/2/4 seconds, in the recovery pass
+and in a steady-state pass that schedules several at once. Subsequent polling is
+fixed-delay, so one target never overlaps itself.
 
 A tick retries once. Two consecutive failed ticks persist `paused`, including
 across restarts; `Banned` and `AuthInvalid` pause immediately. Success clears the

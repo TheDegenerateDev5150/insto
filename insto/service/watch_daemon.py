@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Container
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -33,13 +33,19 @@ class WatchLoadEstimate:
     backend_calls_per_hour_high: float
 
 
-def wants_first_check_now(spec: WatchSpec) -> bool:
+def wants_first_check_now(spec: WatchSpec, *, attempted: Container[str] = frozenset()) -> bool:
     """True for a registration nobody has checked yet that has never failed.
 
-    A crash or a restart loop must not spend quota on every start, so a
-    never-succeeded row that already carries an error keeps its full interval.
+    `attempted` carries the users whose immediate check the daemon has already
+    recorded, so the grant happens at most once per registered user: a restart,
+    an interval edit or a pause/resume cannot buy another paid check.
     """
-    return spec.last_ok is None and spec.consecutive_errors == 0 and spec.last_error is None
+    return (
+        spec.last_ok is None
+        and spec.consecutive_errors == 0
+        and spec.last_error is None
+        and spec.user not in attempted
+    )
 
 
 def initial_watch_delay(spec: WatchSpec, *, now: float, first_check_now: bool = False) -> float:
@@ -51,12 +57,17 @@ def initial_watch_delay(spec: WatchSpec, *, now: float, first_check_now: bool = 
 
 
 def startup_offsets(
-    specs: list[WatchSpec], *, now: float, first_check_now: bool = False
+    specs: list[WatchSpec], *, now: float, granted: Container[str] = frozenset()
 ) -> dict[str, float]:
+    """Delays for one batch of schedules, with every zero delay 2 s apart.
+
+    `granted` names the users whose immediate first check has just been recorded;
+    every other never-checked spec keeps its full interval.
+    """
     delays: dict[str, float] = {}
     overdue_index = 0
     for spec in sorted(specs, key=lambda item: item.user):
-        delay = initial_watch_delay(spec, now=now, first_check_now=first_check_now)
+        delay = initial_watch_delay(spec, now=now, first_check_now=spec.user in granted)
         if delay == 0:
             delay = float(overdue_index * 2)
             overdue_index += 1
@@ -126,6 +137,42 @@ class WatchDaemon:
     def request_reconcile(self) -> None:
         self._wake.set()
 
+    async def _forget_departed_markers(self, known: set[str]) -> set[str]:
+        """Drop markers whose watch row is gone; a real remove + add is prompt again.
+
+        A marker is kept for every user that still has a row, active or paused,
+        so pause/resume, interval edits and `registration_id` rotations all stay
+        memoized. Only a deleted registration forgets its grant.
+        """
+        attempted = await self._history.first_check_attempts_async()
+        for user in sorted(attempted - known):
+            # Retention of a stale marker is harmless; losing one is not, so a
+            # failed delete simply leaves it for the next pass.
+            with contextlib.suppress(Exception):
+                if await self._history.forget_first_check_attempt_async(user):
+                    attempted.discard(user)
+        return attempted
+
+    async def _grant_first_checks(
+        self, specs: list[WatchSpec], attempted: set[str]
+    ) -> frozenset[str]:
+        """Record every grant durably *before* its zero-delay task is scheduled.
+
+        A marker that cannot be written means no immediate check: the spec keeps
+        its full interval rather than buying a paid check nobody could record.
+        """
+        granted: set[str] = set()
+        for spec in sorted(specs, key=lambda item: item.user):
+            if not wants_first_check_now(spec, attempted=attempted):
+                continue
+            try:
+                await self._history.mark_first_check_attempted_async(spec.user)
+            except Exception:
+                continue
+            attempted.add(spec.user)
+            granted.add(spec.user)
+        return frozenset(granted)
+
     async def reconcile_once(self, *, recovering: bool = False) -> None:
         rows = await self._history.list_watches_async()
         persisted = {row.user: row for row in rows if row.status == "active"}
@@ -151,25 +198,28 @@ class WatchDaemon:
         for user in sorted(removals):
             await self._manager.remove(user, release_when_empty=False)
 
+        scheduling = sorted((persisted.keys() - local.keys()) | replacements)
+        pending = [persisted[user] for user in scheduling]
+        # Recovery weighs every active row so a restart keeps its 0/2/4 s ladder;
+        # a steady-state pass weighs the rows it is about to schedule, which
+        # staggers a burst of new registrations the same way.
+        batch = list(persisted.values()) if recovering else pending
         # Only the headless daemon promotes a never-checked registration to an
-        # immediate first tick; the REPL keeps its full-interval first delay.
-        first_check_now = self._role == "daemon"
-        delays = (
-            startup_offsets(
-                list(persisted.values()), now=self._now(), first_check_now=first_check_now
-            )
-            if recovering
-            else {}
-        )
-        for user in sorted((persisted.keys() - local.keys()) | replacements):
+        # immediate first tick; the REPL never reads or writes the markers and
+        # keeps its full-interval first delay.
+        granted: frozenset[str] = frozenset()
+        if self._role == "daemon":
+            attempted = await self._forget_departed_markers({row.user for row in rows})
+            granted = await self._grant_first_checks(pending, attempted)
+        delays = startup_offsets(batch, now=self._now(), granted=granted)
+        for user in scheduling:
             spec = persisted[user]
             self._manager.add(
                 spec,
                 tick=self._tick_factory(user),
                 state_changed=self._persist_state,
                 initial_delay=delays.get(
-                    user,
-                    initial_watch_delay(spec, now=self._now(), first_check_now=first_check_now),
+                    user, initial_watch_delay(spec, now=self._now(), first_check_now=False)
                 ),
             )
 
