@@ -737,6 +737,58 @@ async def test_a_never_terminating_cursor_stops_at_the_page_ceiling(per_page):
     assert result["likes"]["total"] == sum(range(result["analyzed"]))
 
 
+@pytest.mark.parametrize(
+    "lat, lng",
+    [(90.5, 4.9), (-91.0, 4.9), (52.4, 180.5), (52.4, -181.0)],
+    ids=["lat-high", "lat-low", "lng-high", "lng-low"],
+)
+def test_a_coordinate_outside_its_range_is_not_a_location(lat, lng):
+    """The desktop host refuses such a value; the core never sends one."""
+    post = lookup._locatable(make_post(0, place="Somewhere", lat=lat, lng=lng))
+    assert post.location_lat is None and post.location_lng is None
+    assert lookup._centroid(lat, lng) is None
+
+
+@pytest.mark.parametrize("radius", [-1.0, 20_100.5, float("inf")])
+def test_a_radius_no_place_on_earth_can_have_is_not_reported(radius):
+    assert lookup._distance(radius) is None
+
+
+def test_the_largest_real_radius_and_the_poles_are_kept():
+    assert lookup._distance(20_100.0) == 20_100.0
+    assert lookup._centroid(90.0, -180.0) == {"lat": 90.0, "lng": -180.0}
+
+
+async def test_lookup_activity_worst_case_is_twelve_paid_requests():
+    """Six pages, each failing once and then answering: the two factors multiplied.
+
+    `MAX_PAGE_REQUESTS` bounds the pages and the retry policy allows one more
+    attempt per page; the documented ceiling is their product, so this pins
+    the multiplication itself rather than trusting the two tests that prove
+    each factor alone.
+    """
+    import httpx
+
+    requests = []
+    inner = chunk_handler(requests, per_page=1)
+
+    def handler(request):
+        # Every page fails once before it answers, so each costs two requests.
+        attempt = sum(1 for url in requests if url == str(request.url)) + 1
+        if attempt == 1:
+            requests.append(str(request.url))
+            return httpx.Response(500, json={"detail": "provider blip"})
+        return inner(request)
+
+    backend = transport_backend(handler)
+    try:
+        result = await lookup._read(backend, "lookup.activity", {"target_pk": "7", "window": 50})
+    finally:
+        await backend.aclose()
+    assert len(requests) == 2 * lookup.MAX_PAGE_REQUESTS == 12
+    assert result["analyzed"] == lookup.MAX_PAGE_REQUESTS
+
+
 async def test_a_normal_page_reaches_the_largest_window_inside_the_ceiling():
     requests = []
     backend = transport_backend(chunk_handler(requests, per_page=12, total=120))

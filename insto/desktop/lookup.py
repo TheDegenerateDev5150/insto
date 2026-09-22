@@ -305,7 +305,7 @@ def _locatable(post: Post) -> Post:
     """
     if post.location_lat is None and post.location_lng is None:
         return post
-    if _coordinate(post.location_lat) is not None and _coordinate(post.location_lng) is not None:
+    if _latitude(post.location_lat) is not None and _longitude(post.location_lng) is not None:
         return post
     return replace(post, location_lat=None, location_lng=None)
 
@@ -338,6 +338,11 @@ def _moment(value: int | None) -> int | None:
     return value if 0 <= value <= MAX_TIME else None
 
 
+# Half the Earth's circumference along a great circle, rounded up: no two points
+# on the planet are farther apart, so a larger radius is a defect, not a fact.
+MAX_RADIUS_KM = 20_100.0
+
+
 def _coordinate(value: float | None) -> float | None:
     if value is None or not isinstance(value, (int, float)) or isinstance(value, bool):
         return None
@@ -345,9 +350,21 @@ def _coordinate(value: float | None) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _latitude(value: float | None) -> float | None:
+    number = _coordinate(value)
+    return number if number is not None and -90.0 <= number <= 90.0 else None
+
+
+def _longitude(value: float | None) -> float | None:
+    number = _coordinate(value)
+    return number if number is not None and -180.0 <= number <= 180.0 else None
+
+
 def _distance(value: float | None) -> float | None:
     number = _coordinate(value)
-    return None if number is None else round(max(number, 0.0), 3)
+    if number is None or number < 0.0 or number > MAX_RADIUS_KM:
+        return None
+    return round(number, 3)
 
 
 def _average(value: float) -> float:
@@ -356,7 +373,7 @@ def _average(value: float) -> float:
 
 
 def _centroid(lat: float | None, lng: float | None) -> dict[str, float] | None:
-    latitude, longitude = _coordinate(lat), _coordinate(lng)
+    latitude, longitude = _latitude(lat), _longitude(lng)
     if latitude is None or longitude is None:
         return None
     return {"lat": latitude, "lng": longitude}
