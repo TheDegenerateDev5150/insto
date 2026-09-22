@@ -411,6 +411,24 @@ class HikerBackend(OSINTBackend):
             raise self._record_drift(SchemaDrift("user_by_username_v2", "pk"))
         return str(pk)
 
+    async def get_profile_by_username(self, username: str) -> Profile:
+        """One request: `user_by_username_v2` carries the whole profile record.
+
+        Verified against a recorded answer (`tests/fixtures/hiker/
+        profile_by_username_v2.json`): every field `map_profile` reads is
+        present with the same value as `user_by_id_v2` returns for the same
+        account, so the second request bought nothing.
+        """
+        try:
+            payload = await self._call(lambda: self._client.user_by_username_v2(username=username))
+        except _NotFoundError as exc:
+            self._raise_not_found(ProfileNotFound(username), exc)
+        try:
+            user = self._unwrap_user(payload, endpoint="user_by_username_v2")
+            return map_profile(user)
+        except SchemaDrift as exc:
+            raise self._record_drift(exc) from None
+
     async def get_profile(self, pk: str) -> Profile:
         try:
             payload = await self._call(lambda: self._client.user_by_id_v2(id=pk))

@@ -3,6 +3,7 @@
 import asyncio
 import json
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
@@ -105,17 +106,21 @@ class FakeBackend:
         if error is not None:
             raise error
 
-    async def resolve_target(self, username):
-        self.calls.append(("resolve", username))
+    async def get_profile_by_username(self, username):
+        self.calls.append(("profile_by_username", username))
         if self.hang:
             await asyncio.Event().wait()
         self._raise("resolve")
-        return self.profile.pk
-
-    async def get_profile(self, pk):
-        self.calls.append(("profile", pk))
         self._raise("profile")
         return self.profile
+
+    async def resolve_target(self, username):  # pragma: no cover - must never be called
+        self.calls.append(("resolve", username))
+        raise AssertionError("lookup.profile must read the profile in one request")
+
+    async def get_profile(self, pk):  # pragma: no cover - must never be called
+        self.calls.append(("profile", pk))
+        raise AssertionError("lookup.profile must read the profile in one request")
 
     async def get_user_about(self, pk):  # pragma: no cover - must never be called
         self.calls.append(("about", pk))
@@ -186,7 +191,7 @@ async def call(profile, operation, params):
 # --------------------------------------------------------------- lookup.profile
 
 
-async def test_profile_returns_the_tracked_vocabulary_and_costs_two_requests(
+async def test_profile_returns_the_tracked_vocabulary_and_costs_one_request(
     lookup_profile, constructed
 ):
     from insto.service.history import _PROFILE_TRACKED_FIELDS
@@ -219,7 +224,7 @@ async def test_profile_returns_the_tracked_vocabulary_and_costs_two_requests(
     # Exactly the saved-history vocabulary and order, without the media hashes.
     assert list(result["fields"]) == list(_PROFILE_TRACKED_FIELDS)
     assert not {"avatar", "banner"} & set(result["fields"])
-    assert backend.calls == [("resolve", "alice"), ("profile", "17841400000000001")]
+    assert backend.calls == [("profile_by_username", "alice")]
     assert backend.closed == 1
     assert record["token"] == "offline-desktop-token" and record["proxy"] is None
     assert record["max_pages"] == lookup.MAX_PAGE_REQUESTS
@@ -616,7 +621,7 @@ import insto.desktop.lookup as lookup
 
 
 class Hanging:
-    async def resolve_target(self, username):
+    async def get_profile_by_username(self, username):
         await asyncio.Event().wait()
 
     async def iter_user_posts(self, pk, *, limit=None):
@@ -801,19 +806,16 @@ async def test_a_normal_page_reaches_the_largest_window_inside_the_ceiling():
     assert result["analyzed"] == 50
 
 
-async def test_lookup_profile_worst_case_is_four_paid_requests():
-    """Two calls, each with at most the one quick retry the policy allows."""
+async def test_lookup_profile_worst_case_is_two_paid_requests():
+    """One call with at most the one quick retry the policy allows."""
     import httpx
 
     requests = []
 
     def handler(request):
         requests.append(request.url.path)
-        first = requests.count(request.url.path) == 1
-        if first:
+        if len(requests) == 1:
             return httpx.Response(500, json={"detail": "provider blip"})
-        if request.url.path.endswith("/by/username"):
-            return httpx.Response(200, json={"user": {"pk": "7", "username": "alice"}})
         return httpx.Response(
             200,
             json={"user": {"pk": "7", "username": "alice", "follower_count": 3}},
@@ -825,14 +827,12 @@ async def test_lookup_profile_worst_case_is_four_paid_requests():
         result = await lookup._read(backend, "lookup.profile", {"username": "alice"})
     finally:
         await backend.aclose()
-    assert len(requests) == 4
-    assert requests.count("/v2/user/by/username") == 2
-    assert requests.count("/v2/user/by/id") == 2
+    assert requests == ["/v2/user/by/username", "/v2/user/by/username"]
     assert result["target_pk"] == "7" and result["fields"]["follower_count"] == 3
     assert result["quota_remaining"] == 4199
 
 
-async def test_a_provider_that_answers_cleanly_costs_two_requests():
+async def test_a_provider_that_answers_cleanly_costs_one_request():
     import httpx
 
     requests = []
@@ -846,7 +846,42 @@ async def test_a_provider_that_answers_cleanly_costs_two_requests():
         await lookup._read(backend, "lookup.profile", {"username": "alice"})
     finally:
         await backend.aclose()
-    assert requests == ["/v2/user/by/username", "/v2/user/by/id"]
+    assert requests == ["/v2/user/by/username"]
+
+
+async def test_the_recorded_username_answer_carries_every_tracked_field():
+    """The one-request read rests on this: a real `user_by_username_v2` answer
+    maps to the same profile the by-pk read would give, field for field."""
+    import httpx
+
+    from insto.backends._hiker_map import map_profile
+
+    recorded = json.loads(
+        (Path(__file__).parent / "fixtures" / "hiker" / "profile_by_username_v2.json").read_text()
+    )
+    expected = map_profile(recorded["user"])
+    requests = []
+
+    def handler(request):
+        requests.append(request.url.path)
+        return httpx.Response(200, json=recorded)
+
+    backend = transport_backend(handler)
+    try:
+        result = await lookup._read(backend, "lookup.profile", {"username": "instagram"})
+    finally:
+        await backend.aclose()
+    assert requests == ["/v2/user/by/username"]
+    assert result["target_pk"] == expected.pk == "25025320"
+    assert result["unknown_fields"] == []
+    assert result["fields"]["username"] == "instagram"
+    assert result["fields"]["follower_count"] == expected.follower_count > 0
+    assert result["fields"]["media_count"] == expected.media_count > 0
+    assert result["fields"]["is_verified"] is True
+    assert result["fields"]["biography"] == expected.biography != ""
+    assert result["fields"]["external_url"] == expected.external_url
+    # Empty contact strings are reported as absent values, not invented ones.
+    assert result["fields"]["public_email"] is None
 
 
 async def test_the_fake_ceiling_is_the_one_the_lookup_asks_for(lookup_profile, constructed):

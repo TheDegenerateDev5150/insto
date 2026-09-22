@@ -516,7 +516,7 @@ account before the user decides to watch it.
 
 | Operation | Exact params | Budget | Effect |
 | --- | --- | --- | --- |
-| `lookup.profile` | `{"username":"..."}` | network read, 60 s | Resolve the username and read the profile: 2 provider requests, at most 4. |
+| `lookup.profile` | `{"username":"..."}` | network read, 60 s | Read the profile by username: 1 provider request, at most 2. |
 | `lookup.activity` | `{"target_pk":"...","window":12\|30\|50}` | network read, 60 s | One fetch of the most recent `window` posts, then every analysis below from that single list: 1 request plus one per extra page needed to reach the window, at most 6 page requests (12 with retries). |
 
 `username` is canonicalized exactly like `watches.add` and `snapshots.targets`,
@@ -579,8 +579,9 @@ not counted as geotagged at all, so `geotagged`, `places`, `centroid` and
 towards its location name. Nothing else is dropped.
 
 **Paid requests are capped by count, not only by the clock.** `lookup.profile`
-makes 2 requests (resolve, profile) and never more than 4, because each of the
-two may be retried once after a transient failure. `lookup.activity` buys at
+makes 1 request (the provider's username lookup carries the whole record; a
+recorded answer is kept in `tests/fixtures/hiker/profile_by_username_v2.json`)
+and never more than 2, because it may be retried once after a transient failure. `lookup.activity` buys at
 most **6 page requests** — 12 with the same one retry each — whatever the
 provider's cursor claims: 6 covers the largest window (50) at any page of nine
 items or more, and a page of 12 reaches it in 5. A cursor that keeps offering
