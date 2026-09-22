@@ -60,6 +60,15 @@ class OSINTBackend(ABC):
     async def get_profile(self, pk: str) -> Profile:
         """Fetch the full profile DTO for `pk`."""
 
+    async def get_profile_by_username(self, username: str) -> Profile:
+        """Fetch the full profile DTO for `username`.
+
+        The default spends two requests (resolve, then read by pk). A backend
+        whose username lookup already answers with the full record overrides
+        this to spend one.
+        """
+        return await self.get_profile(await self.resolve_target(username))
+
     @abstractmethod
     async def get_user_about(self, pk: str) -> dict[str, Any]:
         """Fetch the `user_about` payload (verification, dates, links)."""

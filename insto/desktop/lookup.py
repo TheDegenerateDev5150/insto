@@ -82,9 +82,7 @@ _COUNTS = ("follower_count", "following_count", "media_count")
 class LookupBackend(Protocol):
     """The provider surface a lookup uses; nothing here mutates anything."""
 
-    async def resolve_target(self, username: str) -> str: ...
-
-    async def get_profile(self, pk: str) -> ProfileDTO: ...
+    async def get_profile_by_username(self, username: str) -> ProfileDTO: ...
 
     def iter_user_posts(self, pk: str, *, limit: int | None = None) -> AsyncIterator[Post]: ...
 
@@ -190,14 +188,15 @@ async def _read(backend: LookupBackend, operation: str, params: dict[str, Any]) 
 
 
 async def _profile(backend: LookupBackend, username: str) -> dict[str, Any]:
-    """Two requests: resolve the username, then read the profile by pk.
+    """One request: the provider's username lookup carries the whole record.
 
-    `user_about` is deliberately not called. Every tracked field below comes
-    from the profile payload itself, so the third request the CLI's `/info`
-    spends would buy this result nothing.
+    Neither `user_by_id` nor `user_about` is called. Every tracked field below
+    comes from that one payload (recorded answer in `tests/fixtures/hiker/
+    profile_by_username_v2.json`), so the two further requests the CLI's
+    `/info` spends would buy this result nothing.
     """
-    pk = await backend.resolve_target(username)
-    found = await backend.get_profile(pk)
+    found = await backend.get_profile_by_username(username)
+    pk = found.pk
     if found.access == "deleted":
         raise DesktopError("target_not_found")
     values: dict[str, Any] = {
